@@ -1,9 +1,8 @@
 services:
-  xml-tool-bridge:
-    build: .
-    image: xml-tool-bridge:local
+  llm-tool-whisper:
+    image: ghcr.io/starlight02/llm-tool-whisper:latest
     ports:
       - "8787:8787"
     volumes:
-      - ./config.toml:/etc/xml-tool-bridge/config.toml:ro
+      - ./config.toml:/etc/llm-tool-whisper/config.toml:ro
     restart: unless-stopped

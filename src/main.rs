@@ -47,13 +47,13 @@ async fn main() -> ExitCode {
         addr = %addr,
         providers = provider_count,
         models = model_count,
-        "starting xml-tool-bridge"
+        "starting llm-tool-whisper"
     );
     match warp::serve(routes).try_bind_with_graceful_shutdown(addr, shutdown_signal()) {
         Ok((bound, server)) => {
             info!(addr = %bound, "listening");
             server.await;
-            info!("xml-tool-bridge stopped");
+            info!("llm-tool-whisper stopped");
             ExitCode::SUCCESS
         }
         Err(error) => {

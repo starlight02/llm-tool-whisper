@@ -16,11 +16,11 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/release/xml-tool-bridge /usr/local/bin/xml-tool-bridge
+COPY --from=builder /app/target/release/llm-tool-whisper /usr/local/bin/llm-tool-whisper
 
 EXPOSE 8787
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD ["wget", "-qO-", "http://127.0.0.1:8787/health"]
 
-CMD ["/usr/local/bin/xml-tool-bridge", "/etc/xml-tool-bridge/config.toml"]
+CMD ["/usr/local/bin/llm-tool-whisper", "/etc/llm-tool-whisper/config.toml"]

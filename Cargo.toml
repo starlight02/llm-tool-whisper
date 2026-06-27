@@ -1,5 +1,5 @@
 [package]
-name = "xml-tool-bridge"
+name = "llm-tool-whisper"
 version = "0.1.0"
 edition = "2024"
 
