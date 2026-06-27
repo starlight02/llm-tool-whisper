@@ -7,9 +7,16 @@ use crate::{
 };
 
 // XML markers are assembled with concat! so the contiguous literal never
-// appears verbatim in source; they equal the strings parse_tool_calls expects.
-const START_MARKER: &str = concat!('<', "tool_call");
-const END_MARKER: &str = concat!("</", "tool_call", ">");
+// appears verbatim in source; they equal the strings parse_tool_calls accepts.
+const START_MARKERS: &[(&str, &str)] = &[
+    (concat!('<', "tool_call"), concat!("</", "tool_call", ">")),
+    (
+        concat!('<', "function_calls"),
+        concat!("</", "function_calls", ">"),
+    ),
+    (concat!('<', "invoke"), concat!("</", "invoke", ">")),
+    (concat!('<', "name"), concat!("</", "tool_call", ">")),
+];
 
 #[derive(Debug)]
 pub enum ScanEvent {
@@ -142,7 +149,7 @@ fn strip_thinking_prefixes(text: &str) -> String {
 #[derive(Default)]
 pub struct Scanner {
     buf: String,
-    capturing: bool,
+    capturing_end: Option<&'static str>,
     tools: Vec<ToolDefinition>,
 }
 
@@ -150,7 +157,7 @@ impl Scanner {
     pub fn new(tools: Vec<ToolDefinition>) -> Self {
         Self {
             buf: String::new(),
-            capturing: false,
+            capturing_end: None,
             tools,
         }
     }
@@ -160,26 +167,26 @@ impl Scanner {
         let mut events = Vec::new();
 
         loop {
-            if self.capturing {
-                let Some(end) = self.buf.find(END_MARKER) else {
+            if let Some(end_marker) = self.capturing_end {
+                let Some(end) = self.buf.find(end_marker) else {
                     return events;
                 };
-                let full: String = self.buf.drain(..end + END_MARKER.len()).collect();
-                self.capturing = false;
+                let full: String = self.buf.drain(..end + end_marker.len()).collect();
+                self.capturing_end = None;
                 flush_parsed(&full, &self.tools, &mut events);
                 continue;
             }
 
-            if let Some(start) = find_start_marker(&self.buf) {
+            if let Some((start, end_marker)) = find_start_marker(&self.buf) {
                 if start > 0 {
                     let safe: String = self.buf.drain(..start).collect();
                     events.push(ScanEvent::Emit(safe));
                 }
-                self.capturing = true;
+                self.capturing_end = Some(end_marker);
                 continue;
             }
 
-            let hold = ambiguous_prefix_len(&self.buf, START_MARKER);
+            let hold = ambiguous_prefix_len(&self.buf);
             let emit_len = self.buf.len() - hold;
             if emit_len > 0 {
                 let safe: String = self.buf.drain(..emit_len).collect();
@@ -192,7 +199,9 @@ impl Scanner {
     pub fn finish(&mut self) -> Vec<ScanEvent> {
         let mut events = Vec::new();
         if !self.buf.is_empty() {
-            events.push(ScanEvent::Emit(std::mem::take(&mut self.buf)));
+            let full = std::mem::take(&mut self.buf);
+            self.capturing_end = None;
+            flush_parsed(&full, &self.tools, &mut events);
         }
         events
     }
@@ -211,11 +220,20 @@ fn flush_parsed(full: &str, tools: &[ToolDefinition], events: &mut Vec<ScanEvent
     }
 }
 
-fn find_start_marker(buf: &str) -> Option<usize> {
+fn find_start_marker(buf: &str) -> Option<(usize, &'static str)> {
+    START_MARKERS
+        .iter()
+        .filter_map(|(start_marker, end_marker)| {
+            find_start_marker_for(buf, start_marker).map(|start| (start, *end_marker))
+        })
+        .min_by_key(|(start, _)| *start)
+}
+
+fn find_start_marker_for(buf: &str, marker: &str) -> Option<usize> {
     let mut offset = 0;
-    while let Some(found) = buf[offset..].find(START_MARKER) {
+    while let Some(found) = buf[offset..].find(marker) {
         let start = offset + found;
-        let after = start + START_MARKER.len();
+        let after = start + marker.len();
         let next = buf[after..].chars().next()?;
         if matches!(next, '>' | '/' | ' ' | '\n' | '\r' | '\t') {
             return Some(start);
@@ -229,13 +247,19 @@ fn find_start_marker(buf: &str) -> Option<usize> {
 /// `marker`. A full marker at chunk end is still ambiguous because the next
 /// byte decides whether this is `<tool_call>` or ordinary text like
 /// `<tool_callx>`.
-fn ambiguous_prefix_len(buf: &str, marker: &str) -> usize {
+fn ambiguous_prefix_len(buf: &str) -> usize {
     let buf_bytes = buf.as_bytes();
-    let marker_bytes = marker.as_bytes();
-    let max = buf_bytes.len().min(marker_bytes.len());
-    (1..=max)
-        .rev()
-        .find(|&len| buf_bytes[buf_bytes.len() - len..] == marker_bytes[..len])
+    START_MARKERS
+        .iter()
+        .map(|(marker, _)| {
+            let marker_bytes = marker.as_bytes();
+            let max = buf_bytes.len().min(marker_bytes.len());
+            (1..=max)
+                .rev()
+                .find(|&len| buf_bytes[buf_bytes.len() - len..] == marker_bytes[..len])
+                .unwrap_or(0)
+        })
+        .max()
         .unwrap_or(0)
 }
 
@@ -288,7 +312,7 @@ mod tests {
 
     fn block(name: &str, args: &str) -> String {
         let mut s = String::new();
-        s.push_str(START_MARKER);
+        s.push_str(START_MARKERS[0].0);
         s.push_str(">\n");
         s.push_str("  <name>");
         s.push_str(name);
@@ -297,7 +321,7 @@ mod tests {
         s.push_str(args);
         s.push_str(CDATA_CLOSE);
         s.push_str("</arguments>\n");
-        s.push_str(END_MARKER);
+        s.push_str(START_MARKERS[0].1);
         s
     }
 
@@ -385,6 +409,118 @@ mod tests {
         assert_eq!(calls[0].name, "Read");
         assert_eq!(calls[0].arguments["file_path"], "README.md");
         assert_eq!(calls[1].arguments["file_path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn detects_bare_function_calls_block_and_suppresses_xml() {
+        let mut s = Scanner::new(vec![read_tool()]);
+        let events = s.feed(
+            r#"<function_calls>
+  <invoke name="Read">
+    <parameter name="file_path">README.md</parameter>
+  </invoke>
+</function_calls>"#,
+        );
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ScanEvent::ToolCall(call) => Some(call.clone()),
+                ScanEvent::Emit(text) => {
+                    assert!(
+                        !text.contains("<function_calls>"),
+                        "function_calls XML leaked: {text:?}"
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+    }
+
+    #[test]
+    fn detects_bare_invoke_and_suppresses_xml() {
+        let mut s = Scanner::new(vec![read_tool()]);
+        let events = s.feed(
+            r#"<invoke name="Read">
+  <parameter name="file_path">README.md</parameter>
+</invoke>"#,
+        );
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ScanEvent::ToolCall(call) => Some(call.clone()),
+                ScanEvent::Emit(text) => {
+                    assert!(!text.contains("<invoke"), "invoke XML leaked: {text:?}");
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+    }
+
+    #[test]
+    fn detects_orphan_name_arguments_and_suppresses_xml() {
+        let mut s = Scanner::new(vec![read_tool()]);
+        let events = s.feed(
+            r#"<name>Read</name>
+    <arguments><![CDATA[{"file_path": "Dockerfile"}
+  </tool_call>"#,
+        );
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ScanEvent::ToolCall(call) => Some(call.clone()),
+                ScanEvent::Emit(text) => {
+                    assert!(
+                        !text.contains("<name>Read</name>"),
+                        "orphan XML leaked: {text:?}"
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "Dockerfile");
+    }
+
+    #[test]
+    fn finish_parses_incomplete_tool_call() {
+        let mut s = Scanner::new(vec![read_tool()]);
+        assert!(
+            s.feed(
+                r#"<tool_call>
+  <function_calls>
+    <invoke name=Read>
+      <parameter name=file_path>README.md"#
+            )
+            .is_empty()
+        );
+        let events = s.finish();
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ScanEvent::ToolCall(call) => Some(call.clone()),
+                ScanEvent::Emit(text) => {
+                    assert!(
+                        !text.contains("<tool_call>"),
+                        "tool_call XML leaked: {text:?}"
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
     }
 
     #[test]

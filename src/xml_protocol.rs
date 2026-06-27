@@ -110,34 +110,141 @@ fn push_tool_selection_guidance(prompt: &mut String, tools: &[ToolDefinition]) {
     }
 }
 
-/// Parse every `<tool_call>` block contained in `text`, in source order.
+/// Parse XML-style tool call fragments contained in `text`, in source order.
 /// A turn may legitimately contain several parallel calls; callers receive
 /// them all rather than only the first one.
 pub fn parse_tool_calls(text: &str, tools: &[ToolDefinition]) -> Vec<XmlToolCall> {
     let mut out = Vec::new();
     let mut cursor = 0;
-    while cursor < text.len() {
-        let Some(rel_start) = text[cursor..].find("<tool_call") else {
-            break;
-        };
-        let start = cursor + rel_start;
-        let Some(rel_end) = text[start..].find("</tool_call>") else {
-            break;
-        };
-        let end = start + rel_end + "</tool_call>".len();
-        let fragment = &text[start..end];
+    while let Some(fragment) = next_tool_fragment(text, cursor, true) {
+        let source = &text[fragment.start..fragment.end];
+        let calls = parse_tool_call_fragment(source, tools);
+        if calls.is_empty() {
+            cursor = fragment.start + 1;
+            continue;
+        }
         out.extend(
-            parse_tool_call_fragment(fragment, tools)
+            calls
                 .into_iter()
                 .map(|call| normalize_tool_call(call, tools)),
         );
-        cursor = end;
+        cursor = fragment.end;
     }
     out
 }
 
+pub fn remove_tool_call_fragments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(fragment) = next_tool_fragment(text, cursor, true) {
+        out.push_str(&text[cursor..fragment.start]);
+        cursor = fragment.end.max(fragment.start + 1);
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+struct ToolFragment {
+    start: usize,
+    end: usize,
+}
+
+fn next_tool_fragment(text: &str, cursor: usize, allow_incomplete: bool) -> Option<ToolFragment> {
+    let wrapped = next_wrapped_tool_fragment(text, cursor, allow_incomplete);
+    let orphan = next_orphan_tool_fragment(text, cursor, allow_incomplete);
+    match (wrapped, orphan) {
+        (Some(a), Some(b)) => Some(if a.start <= b.start { a } else { b }),
+        (Some(fragment), None) | (None, Some(fragment)) => Some(fragment),
+        (None, None) => None,
+    }
+}
+
+fn next_wrapped_tool_fragment(
+    text: &str,
+    cursor: usize,
+    allow_incomplete: bool,
+) -> Option<ToolFragment> {
+    let (rel_start, tag) =
+        find_next_open_tag(&text[cursor..], &["tool_call", "function_calls", "invoke"])?;
+    let start = cursor + rel_start;
+    let tag_body_start = start + tag.len() + 1;
+    let tag_end = text[tag_body_start..].find('>')? + tag_body_start + 1;
+    let open_tag = &text[tag_body_start..tag_end - 1];
+    if open_tag.contains('<') {
+        return next_tool_fragment(text, start + 1, allow_incomplete);
+    }
+    let self_closing = open_tag.trim_end().ends_with('/');
+    let end = if self_closing {
+        tag_end
+    } else if let Some(close_start) = find_close_tag_after(text, tag, tag_end) {
+        close_start + tag.len() + 3
+    } else if allow_incomplete {
+        text.len()
+    } else {
+        return None;
+    };
+
+    Some(ToolFragment { start, end })
+}
+
+fn next_orphan_tool_fragment(
+    text: &str,
+    cursor: usize,
+    allow_incomplete: bool,
+) -> Option<ToolFragment> {
+    let mut search = cursor;
+    while search < text.len() {
+        let rel_start = find_open_tag(&text[search..], "name")?;
+        let start = search + rel_start;
+        let tag_body_start = start + "<name".len();
+        let rel_tag_end = text[tag_body_start..].find('>')?;
+        let tag_end = tag_body_start + rel_tag_end;
+        let name_tag = &text[tag_body_start..tag_end];
+        if name_tag.contains('<') {
+            search = start + 1;
+            continue;
+        }
+
+        let body_start = tag_end + 1;
+        let Some(rel_name_end) = text[body_start..].find("</name>") else {
+            search = start + 1;
+            continue;
+        };
+        let after_name = body_start + rel_name_end + "</name>".len();
+        let Some((rel_args_start, _)) = find_next_open_tag(
+            &text[after_name..],
+            &["arguments", "args", "input", "parameters"],
+        ) else {
+            search = start + 1;
+            continue;
+        };
+        if !text[after_name..after_name + rel_args_start]
+            .trim()
+            .is_empty()
+        {
+            search = start + 1;
+            continue;
+        }
+
+        let args_start = after_name + rel_args_start;
+        let end = if let Some(close_start) = find_close_tag_after(text, "tool_call", args_start) {
+            close_start + "</tool_call>".len()
+        } else if allow_incomplete {
+            text.len()
+        } else {
+            search = start + 1;
+            continue;
+        };
+        return Some(ToolFragment { start, end });
+    }
+    None
+}
+
 fn parse_tool_call_fragment(fragment: &str, tools: &[ToolDefinition]) -> Vec<XmlToolCall> {
     if let Some(call) = parse_strict_tool_call(fragment) {
+        return vec![call];
+    }
+    if let Some(call) = parse_tool_call_attributes(fragment) {
         return vec![call];
     }
     if let Some(calls) = parse_function_calls(fragment) {
@@ -164,6 +271,35 @@ fn parse_strict_tool_call(fragment: &str) -> Option<XmlToolCall> {
     Some(XmlToolCall { name, arguments })
 }
 
+fn parse_tool_call_attributes(fragment: &str) -> Option<XmlToolCall> {
+    let open_tag = opening_tag_body(fragment, "tool_call")?;
+    let name = attribute_alias_value(
+        open_tag,
+        &["name", "tool", "tool_name", "function", "function_name"],
+    )?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let body = outer_tag_body(fragment, "tool_call").unwrap_or_default();
+    let arguments = attribute_alias_value(open_tag, &["arguments", "args", "input"])
+        .map(|raw| parse_parameter_value(&raw))
+        .unwrap_or_else(|| {
+            let parameters = parse_parameter_tags_lenient(body);
+            if is_empty_object(&parameters) {
+                simple_arguments(body)
+            } else {
+                parameters
+            }
+        });
+
+    Some(XmlToolCall {
+        name: name.to_string(),
+        arguments,
+    })
+}
+
 fn parse_function_calls(fragment: &str) -> Option<Vec<XmlToolCall>> {
     parse_function_calls_document(fragment).or_else(|| parse_function_calls_lenient(fragment))
 }
@@ -186,7 +322,12 @@ fn parse_function_calls_document(fragment: &str) -> Option<Vec<XmlToolCall>> {
 }
 
 fn parse_invoke_node(node: Node<'_, '_>) -> Option<XmlToolCall> {
-    let name = node.attribute("name")?.trim();
+    let name = node_attribute_alias(
+        node,
+        &["name", "tool", "tool_name", "function", "function_name"],
+    )
+    .or_else(|| child_text(node, "name"))?
+    .trim();
     if name.is_empty() {
         return None;
     }
@@ -194,15 +335,18 @@ fn parse_invoke_node(node: Node<'_, '_>) -> Option<XmlToolCall> {
     let mut map = serde_json::Map::new();
     for parameter in node
         .children()
-        .filter(|node| node.is_element() && node.tag_name().name() == "parameter")
+        .filter(|node| node.is_element() && matches!(node.tag_name().name(), "parameter" | "param"))
     {
-        let Some(parameter_name) = parameter.attribute("name").map(str::trim) else {
+        let Some(parameter_name) = node_attribute_alias(parameter, &["name", "key"]).map(str::trim)
+        else {
             continue;
         };
         if parameter_name.is_empty() {
             continue;
         }
-        let raw_value = collect_node_text(parameter);
+        let raw_value = node_attribute_alias(parameter, &["value", "content"])
+            .map(str::to_string)
+            .unwrap_or_else(|| collect_node_text(parameter));
         map.insert(
             parameter_name.to_string(),
             parse_parameter_value(&raw_value),
@@ -229,7 +373,7 @@ fn parse_function_calls_lenient(fragment: &str) -> Option<Vec<XmlToolCall>> {
     let mut calls = Vec::new();
     let mut cursor = 0;
     while cursor < fragment.len() {
-        let Some(rel_start) = find_open_tag(&fragment[cursor..], "invoke") else {
+        let Some((rel_start, _)) = find_next_open_tag(&fragment[cursor..], &["invoke"]) else {
             break;
         };
         let start = cursor + rel_start;
@@ -239,19 +383,34 @@ fn parse_function_calls_lenient(fragment: &str) -> Option<Vec<XmlToolCall>> {
         };
         let tag_end = tag_body_start + rel_tag_end;
         let tag = &fragment[tag_body_start..tag_end];
+        if tag.contains('<') {
+            cursor = start + 1;
+            continue;
+        }
         let self_closing = tag.trim_end().ends_with('/');
         let body_start = tag_end + 1;
         let (body, next_cursor) = if self_closing {
             ("", body_start)
         } else {
-            let Some(rel_close) = fragment[body_start..].find("</invoke>") else {
-                break;
-            };
-            let close = body_start + rel_close;
-            (&fragment[body_start..close], close + "</invoke>".len())
+            match fragment[body_start..].find("</invoke>") {
+                Some(rel_close) => {
+                    let close = body_start + rel_close;
+                    (&fragment[body_start..close], close + "</invoke>".len())
+                }
+                None => {
+                    if let Some((next_rel, _)) =
+                        find_next_open_tag(&fragment[body_start..], &["invoke"])
+                    {
+                        let next = body_start + next_rel;
+                        (&fragment[body_start..next], next)
+                    } else {
+                        (&fragment[body_start..], fragment.len())
+                    }
+                }
+            }
         };
 
-        if let Some(name) = xml_attribute_value(tag, "name")
+        if let Some(name) = invoke_name_from_tag_and_body(tag, body)
             && !name.trim().is_empty()
         {
             calls.push(XmlToolCall {
@@ -269,31 +428,50 @@ fn parse_parameter_tags_lenient(body: &str) -> Value {
     let mut map = serde_json::Map::new();
     let mut cursor = 0;
     while cursor < body.len() {
-        let Some(rel_start) = find_open_tag(&body[cursor..], "parameter") else {
+        let Some((rel_start, tag_name)) =
+            find_next_open_tag(&body[cursor..], &["parameter", "param"])
+        else {
             break;
         };
         let start = cursor + rel_start;
-        let tag_body_start = start + "<parameter".len();
+        let tag_body_start = start + tag_name.len() + 1;
         let Some(rel_tag_end) = body[tag_body_start..].find('>') else {
             break;
         };
         let tag_end = tag_body_start + rel_tag_end;
         let tag = &body[tag_body_start..tag_end];
+        if tag.contains('<') {
+            cursor = start + 1;
+            continue;
+        }
         let self_closing = tag.trim_end().ends_with('/');
         let value_start = tag_end + 1;
         let (raw_value, next_cursor) = if self_closing {
             ("", value_start)
         } else {
-            let Some(rel_close) = body[value_start..].find("</parameter>") else {
-                break;
-            };
-            let close = value_start + rel_close;
-            (&body[value_start..close], close + "</parameter>".len())
+            match body[value_start..].find("</parameter>") {
+                Some(rel_close) => {
+                    let close = value_start + rel_close;
+                    (&body[value_start..close], close + "</parameter>".len())
+                }
+                None => {
+                    if let Some((next_rel, _)) =
+                        find_next_open_tag(&body[value_start..], &["parameter", "param"])
+                    {
+                        let next = value_start + next_rel;
+                        (&body[value_start..next], next)
+                    } else {
+                        (&body[value_start..], body.len())
+                    }
+                }
+            }
         };
 
-        if let Some(name) = xml_attribute_value(tag, "name")
+        if let Some(name) = attribute_alias_value(tag, &["name", "key"])
             && !name.trim().is_empty()
         {
+            let raw_value = attribute_alias_value(tag, &["value", "content"])
+                .unwrap_or_else(|| raw_value.trim().to_string());
             let raw_value = strip_cdata(raw_value.trim()).unwrap_or(raw_value.trim());
             let value = unescape_xml(raw_value);
             map.insert(name.trim().to_string(), parse_parameter_value(&value));
@@ -311,6 +489,58 @@ fn parse_parameter_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
+fn opening_tag_body<'a>(fragment: &'a str, tag: &str) -> Option<&'a str> {
+    let start = find_open_tag(fragment, tag)?;
+    let tag_body_start = start + tag.len() + 1;
+    let tag_end = fragment[tag_body_start..].find('>')? + tag_body_start;
+    Some(&fragment[tag_body_start..tag_end])
+}
+
+fn outer_tag_body<'a>(fragment: &'a str, tag: &str) -> Option<&'a str> {
+    let start = find_open_tag(fragment, tag)?;
+    let tag_body_start = start + tag.len() + 1;
+    let body_start = fragment[tag_body_start..].find('>')? + tag_body_start + 1;
+    let close_tag = format!("</{tag}>");
+    let body_end = fragment[body_start..]
+        .find(&close_tag)
+        .map(|idx| body_start + idx)
+        .unwrap_or(fragment.len());
+    Some(&fragment[body_start..body_end])
+}
+
+fn invoke_name_from_tag_and_body(tag: &str, body: &str) -> Option<String> {
+    attribute_alias_value(
+        tag,
+        &["name", "tool", "tool_name", "function", "function_name"],
+    )
+    .or_else(|| {
+        tag_text_any(
+            body,
+            &["name", "tool", "tool_name", "function", "function_name"],
+        )
+    })
+}
+
+fn attribute_alias_value(tag: &str, aliases: &[&str]) -> Option<String> {
+    aliases
+        .iter()
+        .find_map(|alias| xml_attribute_value(tag, alias))
+}
+
+fn node_attribute_alias<'a>(node: Node<'a, 'a>, aliases: &[&str]) -> Option<&'a str> {
+    aliases.iter().find_map(|alias| node.attribute(*alias))
+}
+
+fn is_empty_object(value: &Value) -> bool {
+    value.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+fn find_next_open_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|tag| find_open_tag(text, tag).map(|start| (start, *tag)))
+        .min_by_key(|(start, _)| *start)
+}
+
 fn find_open_tag(text: &str, tag: &str) -> Option<usize> {
     let marker = format!("<{tag}");
     let mut offset = 0;
@@ -324,6 +554,11 @@ fn find_open_tag(text: &str, tag: &str) -> Option<usize> {
         offset = after;
     }
     None
+}
+
+fn find_close_tag_after(text: &str, tag: &str, from: usize) -> Option<usize> {
+    let close = format!("</{tag}>");
+    text[from..].find(&close).map(|idx| from + idx)
 }
 
 fn xml_attribute_value(tag: &str, attr: &str) -> Option<String> {
@@ -364,8 +599,15 @@ fn xml_attribute_value(tag: &str, attr: &str) -> Option<String> {
 
         let quote = bytes[cursor];
         if quote != b'"' && quote != b'\'' {
-            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+            let value_start = cursor;
+            while cursor < bytes.len()
+                && !bytes[cursor].is_ascii_whitespace()
+                && bytes[cursor] != b'/'
+            {
                 cursor += 1;
+            }
+            if key == attr {
+                return Some(unescape_xml(&tag[value_start..cursor]));
             }
             continue;
         }
@@ -388,10 +630,12 @@ fn xml_attribute_value(tag: &str, attr: &str) -> Option<String> {
 }
 
 fn parse_lenient_tool_call(fragment: &str, tools: &[ToolDefinition]) -> Option<XmlToolCall> {
-    if let Some(name) = tag_text(fragment, "name") {
-        let arguments = tag_text(fragment, "arguments")
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .unwrap_or_else(|| simple_arguments(fragment));
+    if let Some(name) = tag_text_any(
+        fragment,
+        &["name", "tool", "tool_name", "function", "function_name"],
+    ) {
+        let arguments =
+            parse_arguments_value(fragment).unwrap_or_else(|| simple_arguments(fragment));
         return Some(XmlToolCall { name, arguments });
     }
 
@@ -553,7 +797,16 @@ fn simple_arguments(fragment: &str) -> Value {
             .trim_end_matches('/');
         rest = &rest[close + 1..];
         if tag.is_empty()
-            || matches!(tag, "tool_call" | "name" | "arguments")
+            || matches!(
+                tag,
+                "tool_call"
+                    | "name"
+                    | "arguments"
+                    | "function_calls"
+                    | "invoke"
+                    | "parameter"
+                    | "param"
+            )
             || tag.chars().next().is_some_and(char::is_uppercase)
         {
             continue;
@@ -567,6 +820,155 @@ fn simple_arguments(fragment: &str) -> Value {
         rest = &rest[value_end + close_tag.len()..];
     }
     Value::Object(map)
+}
+
+fn parse_arguments_value(fragment: &str) -> Option<Value> {
+    tag_text_any(fragment, &["arguments", "args", "input", "parameters"])
+        .or_else(|| tag_body_lenient_any(fragment, &["arguments", "args", "input", "parameters"]))
+        .map(|raw| parse_arguments_text(&raw))
+}
+
+fn parse_arguments_text(raw: &str) -> Value {
+    let raw = strip_cdata_lenient(raw.trim()).trim();
+    if raw.is_empty() {
+        return json!({});
+    }
+    serde_json::from_str(raw)
+        .ok()
+        .or_else(|| parse_json_object_lenient(raw))
+        .unwrap_or_else(|| Value::String(raw.to_string()))
+}
+
+fn parse_json_object_lenient(raw: &str) -> Option<Value> {
+    let mut inner = raw.trim();
+    inner = inner.strip_prefix('{').unwrap_or(inner).trim();
+    inner = inner.strip_suffix('}').unwrap_or(inner).trim();
+
+    let mut map = serde_json::Map::new();
+    let mut cursor = 0;
+    while let Some((key, colon)) = find_json_key(inner, cursor) {
+        let mut value_start = colon + 1;
+        while value_start < inner.len() && inner.as_bytes()[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+
+        let quoted = inner.as_bytes().get(value_start) == Some(&b'"');
+        if quoted {
+            value_start += 1;
+        }
+
+        let delimiter = find_next_json_pair_delimiter(inner, value_start);
+        let value_end = delimiter.unwrap_or(inner.len());
+        let raw_value = inner[value_start..value_end].trim();
+        let value = if quoted {
+            Value::String(clean_lenient_string(raw_value))
+        } else {
+            serde_json::from_str(raw_value).unwrap_or_else(|_| {
+                Value::String(raw_value.trim_end_matches(',').trim().to_string())
+            })
+        };
+        map.insert(key, value);
+
+        let Some(next) = delimiter else {
+            break;
+        };
+        cursor = next + 1;
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
+}
+
+fn find_json_key(text: &str, from: usize) -> Option<(String, usize)> {
+    let mut cursor = from;
+    while cursor < text.len() {
+        let rel_start = text[cursor..].find('"')?;
+        let key_start = cursor + rel_start + 1;
+        let rel_end = text[key_start..].find('"')?;
+        let key_end = key_start + rel_end;
+        let mut colon = key_end + 1;
+        while colon < text.len() && text.as_bytes()[colon].is_ascii_whitespace() {
+            colon += 1;
+        }
+        if text.as_bytes().get(colon) == Some(&b':') {
+            return Some((text[key_start..key_end].to_string(), colon));
+        }
+        cursor = key_end + 1;
+    }
+    None
+}
+
+fn find_next_json_pair_delimiter(text: &str, from: usize) -> Option<usize> {
+    let mut cursor = from;
+    while cursor < text.len() {
+        let rel_comma = text[cursor..].find(',')?;
+        let comma = cursor + rel_comma;
+        let mut after = comma + 1;
+        while after < text.len() && text.as_bytes()[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        if text.as_bytes().get(after) != Some(&b'"') {
+            cursor = comma + 1;
+            continue;
+        }
+        let key_start = after + 1;
+        let rel_key_end = text[key_start..].find('"')?;
+        let key_end = key_start + rel_key_end;
+        let mut colon = key_end + 1;
+        while colon < text.len() && text.as_bytes()[colon].is_ascii_whitespace() {
+            colon += 1;
+        }
+        if text.as_bytes().get(colon) == Some(&b':') {
+            return Some(comma);
+        }
+        cursor = comma + 1;
+    }
+    None
+}
+
+fn clean_lenient_string(raw: &str) -> String {
+    let mut value = raw.trim();
+    if let Some(stripped) = value.strip_suffix('"') {
+        value = stripped;
+    }
+    unescape_jsonish_string(value.trim())
+}
+
+fn unescape_jsonish_string(value: &str) -> String {
+    value
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+}
+
+fn tag_body_lenient_any(fragment: &str, tags: &[&str]) -> Option<String> {
+    tags.iter().find_map(|tag| tag_body_lenient(fragment, tag))
+}
+
+fn tag_body_lenient(fragment: &str, tag: &str) -> Option<String> {
+    let start = find_open_tag(fragment, tag)?;
+    let tag_body_start = start + tag.len() + 1;
+    let tag_end = fragment[tag_body_start..].find('>')? + tag_body_start;
+    if fragment[tag_body_start..tag_end].contains('<') {
+        return None;
+    }
+    let body_start = tag_end + 1;
+    let close_tag = format!("</{tag}>");
+    let body_end = fragment[body_start..]
+        .find(&close_tag)
+        .or_else(|| fragment[body_start..].find("</tool_call>"))
+        .map(|idx| body_start + idx)
+        .unwrap_or(fragment.len());
+    Some(unescape_xml(fragment[body_start..body_end].trim()))
+}
+
+fn tag_text_any(fragment: &str, tags: &[&str]) -> Option<String> {
+    tags.iter().find_map(|tag| tag_text(fragment, tag))
 }
 
 fn tag_text(fragment: &str, tag: &str) -> Option<String> {
@@ -587,6 +989,13 @@ fn tag_text(fragment: &str, tag: &str) -> Option<String> {
 fn strip_cdata(raw: &str) -> Option<&str> {
     raw.strip_prefix("<![CDATA[")
         .and_then(|s| s.strip_suffix("]]>"))
+}
+
+fn strip_cdata_lenient(raw: &str) -> &str {
+    let Some(stripped) = raw.strip_prefix("<![CDATA[") else {
+        return raw;
+    };
+    stripped.strip_suffix("]]>").unwrap_or(stripped)
 }
 
 pub fn build_tool_call(name: &str, arguments: Value) -> String {
@@ -724,16 +1133,16 @@ mod tests {
 <tool_call>
   <function_calls>
     <invoke name="Read">
-      <parameter name="file_path">/Users/starshine/Documents/Workspace/xml-tool-bridge/README.md</parameter>
+      <parameter name="file_path">/Users/starshine/Documents/Workspace/llm-tool-whisper/README.md</parameter>
     </invoke>
     <invoke name="Read">
-      <parameter name="file_path">/Users/starshine/Documents/Workspace/xml-tool-bridge/Dockerfile</parameter>
+      <parameter name="file_path">/Users/starshine/Documents/Workspace/llm-tool-whisper/Dockerfile</parameter>
     </invoke>
     <invoke name="Read">
-      <parameter name="file_path">/Users/starshine/Documents/Workspace/xml-tool-bridge/docker-compose.yml</parameter>
+      <parameter name="file_path">/Users/starshine/Documents/Workspace/llm-tool-whisper/docker-compose.yml</parameter>
     </invoke>
     <invoke name="Read">
-      <parameter name="file_path">/Users/starshine/Documents/Workspace/xml-tool-bridge/Cargo.toml</parameter>
+      <parameter name="file_path">/Users/starshine/Documents/Workspace/llm-tool-whisper/Cargo.toml</parameter>
     </invoke>
   </function_calls>
 </tool_call>"#,
@@ -744,11 +1153,11 @@ mod tests {
         assert!(calls.iter().all(|call| call.name == "Read"));
         assert_eq!(
             calls[0].arguments["file_path"],
-            "/Users/starshine/Documents/Workspace/xml-tool-bridge/README.md"
+            "/Users/starshine/Documents/Workspace/llm-tool-whisper/README.md"
         );
         assert_eq!(
             calls[3].arguments["file_path"],
-            "/Users/starshine/Documents/Workspace/xml-tool-bridge/Cargo.toml"
+            "/Users/starshine/Documents/Workspace/llm-tool-whisper/Cargo.toml"
         );
     }
 
@@ -791,6 +1200,150 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Search");
         assert_eq!(calls[0].arguments["query"], "Cargo & Dockerfile");
+    }
+
+    #[test]
+    fn parses_bare_function_calls_without_tool_call_wrapper() {
+        let calls = parse_tool_calls(
+            r#"I'll read it now.
+<function_calls>
+  <invoke name="Read">
+    <parameter name="file_path">README.md</parameter>
+  </invoke>
+</function_calls>"#,
+            &[read_tool()],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+    }
+
+    #[test]
+    fn parses_bare_invoke_without_wrappers() {
+        let calls = parse_tool_calls(
+            r#"<invoke name="Read">
+  <parameter name="file_path">README.md</parameter>
+</invoke>"#,
+            &[read_tool()],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+    }
+
+    #[test]
+    fn parses_incomplete_tool_call_at_end_of_text() {
+        let calls = parse_tool_calls(
+            r#"<tool_call>
+  <function_calls>
+    <invoke name=Read>
+      <parameter name=file_path>README.md"#,
+            &[read_tool()],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+    }
+
+    #[test]
+    fn parses_tool_call_name_attribute_with_parameter_value_attribute() {
+        let calls = parse_tool_calls(
+            r#"<tool_call name=Read>
+  <parameter name=file_path value="README.md" />
+</tool_call>"#,
+            &[read_tool()],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+    }
+
+    #[test]
+    fn parses_orphan_name_arguments_blocks_without_opening_tool_call() {
+        let calls = parse_tool_calls(
+            r#"<name>Read</name>
+    <arguments><![CDATA[{"file_path": "/Users/starshine/Documents/Workspace/llm-tool-whisper/Dockerfile"}
+  </tool_call>
+    <name>Read</name>
+    <arguments><![CDATA[{"file_path": "/Users/starshine/Documents/Workspace/llm-tool-whisper/docker-compose.yml"}
+  </tool_call>
+    <name>Bash</name>
+    <arguments><![CDATA[{"command": "ls -la /Users/starshine/Documents/Workspace/llm-tool-whisper/.github/workflows/ 2>/dev/null || echo "NO_WORKFLOWS_DIR"", "description": "Check for existing GitHub
+  workflows"}
+  </tool_call>
+    <name>Bash</name>
+    <arguments><![CDATA[{"command": "cd /Users/starshine/Documents/Workspace/llm-tool-whisper && git remote -v", "description": "Check git remote URL for repo name"}
+  </tool_call>"#,
+            &[read_tool(), bash_tool()],
+        );
+
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "/Users/starshine/Documents/Workspace/llm-tool-whisper/Dockerfile"
+        );
+        assert_eq!(
+            calls[1].arguments["file_path"],
+            "/Users/starshine/Documents/Workspace/llm-tool-whisper/docker-compose.yml"
+        );
+        assert_eq!(calls[2].name, "Bash");
+        assert_eq!(
+            calls[2].arguments["command"],
+            "ls -la /Users/starshine/Documents/Workspace/llm-tool-whisper/.github/workflows/ 2>/dev/null || echo \"NO_WORKFLOWS_DIR\""
+        );
+        assert_eq!(
+            calls[2].arguments["description"],
+            "Check for existing GitHub\n  workflows"
+        );
+        assert_eq!(
+            calls[3].arguments["command"],
+            "cd /Users/starshine/Documents/Workspace/llm-tool-whisper && git remote -v"
+        );
+    }
+
+    #[test]
+    fn strips_orphan_name_arguments_blocks_from_visible_text() {
+        let visible = remove_tool_call_fragments(
+            r#"pre <name>Read</name>
+    <arguments><![CDATA[{"file_path": "Dockerfile"}
+  </tool_call> post"#,
+        );
+
+        assert_eq!(visible, "pre  post");
+    }
+
+    #[test]
+    fn strips_bare_function_calls_from_visible_text() {
+        let visible = remove_tool_call_fragments(
+            r#"pre <function_calls>
+  <invoke name="Read">
+    <parameter name="file_path">README.md</parameter>
+  </invoke>
+</function_calls> post"#,
+        );
+
+        assert_eq!(visible, "pre  post");
+    }
+
+    #[test]
+    fn invalid_pseudo_invoke_does_not_hide_later_valid_call() {
+        let calls = parse_tool_calls(
+            r#"literal <invoke maybe prose
+<tool_call>
+  <name>Read</name>
+  <arguments><![CDATA[{"file_path":"README.md"}]]></arguments>
+</tool_call>"#,
+            &[read_tool()],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
     }
 
     #[test]

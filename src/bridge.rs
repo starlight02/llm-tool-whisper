@@ -20,6 +20,7 @@ use crate::{
     },
     xml_protocol::{
         XmlToolCall, build_system_prompt, build_tool_call, build_tool_result, parse_tool_calls,
+        remove_tool_call_fragments,
     },
 };
 
@@ -859,28 +860,12 @@ fn json_snippet(value: &Value) -> String {
         .unwrap_or_else(|_| "<unserializable>".to_string())
 }
 
-/// Strip every `<tool_call>...</tool_call>` block from `text`, returning only
-/// the visible prose. Used to recover the assistant's commentary that
-/// surrounds tool calls so it can be delivered to the client alongside the
-/// native tool-call response.
+/// Strip XML-style tool-call fragments from `text`, returning only the visible
+/// prose. Used to recover the assistant's commentary that surrounds tool calls
+/// so it can be delivered to the client alongside the native tool-call
+/// response.
 fn remove_tool_call_blocks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while cursor < text.len() {
-        let Some(rel_start) = text[cursor..].find("<tool_call") else {
-            out.push_str(&text[cursor..]);
-            break;
-        };
-        let start = cursor + rel_start;
-        let Some(rel_end) = text[start..].find("</tool_call>") else {
-            out.push_str(&text[cursor..]);
-            break;
-        };
-        let end = start + rel_end + "</tool_call>".len();
-        out.push_str(&text[cursor..start]);
-        cursor = end;
-    }
-    out
+    remove_tool_call_fragments(text)
 }
 
 fn native_tool_calls_response(
