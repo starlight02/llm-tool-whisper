@@ -1,0 +1,45 @@
+[server]
+bind = "0.0.0.0:8787"
+# Maximum request body size in megabytes (default 32). Bumps useful for long
+# Anthropic tool-result histories.
+body_limit_mb = 32
+
+[log]
+level = "info"
+
+# Upstream behavior. Defaults work for most providers; override per
+# deployment if your network or upstream needs tighter / looser bounds.
+[upstream]
+# Cap on establishing the TCP/TLS connection to the upstream.
+connect_timeout_secs = 20
+# End-to-end cap for one non-streaming upstream turn. Streaming turns are
+# NOT bounded by this — they run as long as the client SSE.
+json_total_timeout_secs = 300
+# SSE keepalive comment frame interval. Keep this below the idle timeout
+# of any nginx / cloud load balancer fronting this proxy.
+sse_keepalive_secs = 15
+
+[[providers]]
+name = "openai"
+protocol = "chat"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-your-openai-key"
+models = [
+  "gpt-4.1",
+  "gpt-4.1-mini",
+]
+
+[[providers]]
+name = "anthropic"
+protocol = "messages"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-your-anthropic-key"
+auth_header = "x-api-key"
+auth_scheme = ""
+headers = { "anthropic-version" = "2023-06-01" }
+models = [
+  "claude-fable-5",
+  "claude-opus-4-8",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
+]

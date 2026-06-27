@@ -1,0 +1,9 @@
+services:
+  xml-tool-bridge:
+    build: .
+    image: xml-tool-bridge:local
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./config.toml:/etc/xml-tool-bridge/config.toml:ro
+    restart: unless-stopped

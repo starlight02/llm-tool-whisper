@@ -1,0 +1,21 @@
+[package]
+name = "xml-tool-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1"
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
+futures-channel = "0.3"
+futures-util = "0.3.31"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+roxmltree = "0.20.0"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.134"
+thiserror = "2.0.9"
+tokio = { version = "1.42.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+toml = "0.8.19"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+uuid = { version = "1.11.0", features = ["v4"] }
+warp = { version = "0.3.7", default-features = false }

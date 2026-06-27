@@ -1,0 +1,12 @@
+/target
+config.toml
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.alma-snapshots
