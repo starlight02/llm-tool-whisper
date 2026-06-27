@@ -108,8 +108,6 @@ api_key = "your_anthropic_api_key_here"
 auth_header = "x-api-key"
 auth_scheme = ""
 headers = { "anthropic-version" = "2023-06-01" }
-# Default: true. Set false for upstreams that already accept native tools.
-bridge_tools = true
 models = [
   "claude-fable-5",
   "claude-opus-4-8",
@@ -123,7 +121,6 @@ protocol = "messages"
 upstream_protocol = "chat"
 base_url = "https://api.example.com/v1"
 api_key = "your_provider_api_key_here"
-bridge_tools = true
 models = ["example-chat-model"]
 ```
 
@@ -131,15 +128,10 @@ Provider auth is a default. If the client already sends the same header, the
 client header wins. This lets the proxy run with configured credentials while
 still allowing per-request overrides.
 
-`bridge_tools` controls whether tool requests are translated into XML prompt
-instructions. Keep the default `true` for upstreams without native tool support.
-Set it to `false` for upstreams that already accept the request protocol's
-native `tools` field; those requests are then passed through with only the
-provider-prefixed model id rewritten to the bare upstream model id.
-
-For `protocol = "messages"` plus `upstream_protocol = "chat"`, keep
-`bridge_tools = true`. That conversion uses XML tool bridge and does not pass
-native Chat tool calls through.
+Tool definitions in a request are always translated into XML prompt
+instructions before being sent upstream; the model's XML tool calls are then
+parsed back into the client protocol's native tool-call response. This is the
+proxy's whole purpose, so it needs no configuration.
 
 `upstream_protocol` is optional and defaults to `protocol`. Same-protocol
 providers can use `chat`, `responses`, or `messages`. Cross-protocol conversion
@@ -197,14 +189,19 @@ docker run --rm -p 8787:8787 \
 
 ### CI
 
-Image builds are driven by `.github/workflows/docker.yml`. The job:
+Image builds are driven by `.github/workflows/docker.yml`. Each architecture is
+built on a **native** runner — no QEMU emulation — and the per-arch images are
+merged into one multi-arch manifest:
 
 1. Checks out the repo.
-2. Sets up Docker Buildx + QEMU for multi-arch emulation.
-3. Logs in to GHCR using the auto-provisioned `GITHUB_TOKEN`.
-4. Builds and pushes `linux/amd64,linux/arm64` with the right tags
-   (`latest` on `main`/`master`, `vX.Y.Z` + major on `v*` tags, and the short
-   SHA on every build for traceability).
+2. Builds `linux/amd64` on `ubuntu-latest` and `linux/arm64` on the native
+   `ubuntu-24.04-arm` runner, in parallel.
+3. On push/tag, each leg logs in to GHCR (auto-provisioned `GITHUB_TOKEN`) and
+   pushes a digest-only image; a final `merge` job stitches the digests into one
+   manifest and applies the tags (`latest` on `main`/`master`, `vX.Y.Z` + major
+   on `v*` tags, and the short SHA on every build for traceability).
+4. On pull requests nothing is pushed — both arches are built into the cache
+   only, to prove the image still compiles.
 
 No secrets need configuration. GitHub Actions provides the `GITHUB_TOKEN` with
 `packages: write`.

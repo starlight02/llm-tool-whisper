@@ -99,11 +99,6 @@ pub struct ProviderConfig {
     pub auth_scheme: String,
     #[serde(default)]
     pub headers: HashMap<String, String>,
-    /// When true, client tool definitions are translated into XML instructions
-    /// for upstreams without native tool support. Set false for upstreams that
-    /// already accept the client protocol's native tools.
-    #[serde(default = "default_bridge_tools")]
-    pub bridge_tools: bool,
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -122,7 +117,6 @@ impl std::fmt::Debug for ProviderConfig {
             .field("auth_header", &self.auth_header)
             .field("auth_scheme", &self.auth_scheme)
             .field("header_keys", &self.headers.keys().collect::<Vec<_>>())
-            .field("bridge_tools", &self.bridge_tools)
             .field("models", &self.models)
             .finish()
     }
@@ -153,10 +147,6 @@ fn default_auth_header() -> String {
 
 fn default_auth_scheme() -> String {
     "Bearer".to_string()
-}
-
-fn default_bridge_tools() -> bool {
-    true
 }
 
 fn default_body_limit_mb() -> u64 {

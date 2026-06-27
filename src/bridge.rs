@@ -128,13 +128,12 @@ impl Bridge {
         let request_needs_tool_bridge = needs_tool_bridge(protocol, &upstream_value);
         let protocol_translate = protocol != upstream_protocol;
 
-        if (!route.provider.bridge_tools || !request_needs_tool_bridge) && !protocol_translate {
+        if !request_needs_tool_bridge && !protocol_translate {
             info!(
                 protocol = protocol.as_path_label(),
                 model = route.upstream_model,
                 tool_bridge = false,
-                native_tools = !route.provider.bridge_tools,
-                "forwarding request"
+                "forwarding request without tools"
             );
             let body = Bytes::from(serde_json::to_vec(&upstream_value)?);
             return self
@@ -151,7 +150,7 @@ impl Bridge {
                 )
                 .await;
         }
-        let tools = if route.provider.bridge_tools && request_needs_tool_bridge {
+        let tools = if request_needs_tool_bridge {
             collect_tools(&upstream_value)?
         } else {
             Vec::new()
@@ -165,14 +164,14 @@ impl Bridge {
             protocol = protocol.as_path_label(),
             upstream_protocol = upstream_protocol.as_path_label(),
             model = route.upstream_model,
-            tool_bridge = route.provider.bridge_tools && request_needs_tool_bridge,
+            tool_bridge = request_needs_tool_bridge,
             protocol_translate,
             tool_count = tools.len(),
             tool_names = %tool_names,
             "bridging upstream request"
         );
 
-        let template = if route.provider.bridge_tools && request_needs_tool_bridge {
+        let template = if request_needs_tool_bridge {
             prepare_tool_request(protocol, upstream_value, &tools)
         } else {
             upstream_value
@@ -230,6 +229,7 @@ impl Bridge {
         let body_audit = self.log_upstream_body_models(protocol, models, &body, "passthrough");
         let request_headers = sanitized_headers_for_log(headers);
         let request_body = request_body_for_log(&body);
+        let body_len = body.len();
         debug!(
             protocol = protocol.as_path_label(),
             client_model = models.client,
@@ -238,7 +238,7 @@ impl Bridge {
             upstream_url = url,
             upstream_request_headers = %request_headers,
             upstream_request_body = %request_body,
-            upstream_request_body_bytes = body.len(),
+            upstream_request_body_bytes = body_len,
             "sending upstream passthrough request"
         );
         let response = match forward_request(client, url, headers, body).send().await {
@@ -253,7 +253,7 @@ impl Bridge {
                     upstream_url = url,
                     upstream_request_headers = %request_headers,
                     upstream_request_body = %request_body,
-                    upstream_request_body_bytes = request_body.len(),
+                    upstream_request_body_bytes = body_len,
                     elapsed_ms = started.elapsed().as_millis(),
                     error = %error,
                     "upstream passthrough failed"
@@ -285,7 +285,7 @@ impl Bridge {
                 upstream_url = url,
                 upstream_request_headers = %request_headers,
                 upstream_request_body = %request_body,
-                upstream_request_body_bytes = request_body.len(),
+                upstream_request_body_bytes = body_len,
                 elapsed_ms = started.elapsed().as_millis(),
                 "upstream passthrough returned error"
             );
@@ -337,6 +337,7 @@ impl Bridge {
         let body = Bytes::from(serde_json::to_vec(&template)?);
         let request_headers = sanitized_headers_for_log(headers);
         let request_body = request_body_for_log(&body);
+        let body_len = body.len();
         let body_audit =
             self.log_upstream_body_models(protocols.client, models, &body, "tool_bridge_json");
         debug!(
@@ -348,7 +349,7 @@ impl Bridge {
             upstream_url = url,
             upstream_request_headers = %request_headers,
             upstream_request_body = %request_body,
-            upstream_request_body_bytes = body.len(),
+            upstream_request_body_bytes = body_len,
             "sending tool bridge upstream JSON request"
         );
         let turn =
@@ -368,7 +369,7 @@ impl Bridge {
                         upstream_url = url,
                         upstream_request_headers = %request_headers,
                         upstream_request_body = %request_body,
-                        upstream_request_body_bytes = request_body.len(),
+                        upstream_request_body_bytes = body_len,
                         elapsed_ms = started.elapsed().as_millis(),
                         error = %error,
                         "tool bridge upstream JSON failed"
@@ -401,7 +402,7 @@ impl Bridge {
                 upstream_url = url,
                 upstream_request_headers = %request_headers,
                 upstream_request_body = %request_body,
-                upstream_request_body_bytes = request_body.len(),
+                upstream_request_body_bytes = body_len,
                 elapsed_ms = started.elapsed().as_millis(),
                 "tool bridge upstream returned error"
             );
@@ -495,6 +496,7 @@ impl Bridge {
         let body = Bytes::from(serde_json::to_vec(&template)?);
         let request_headers = sanitized_headers_for_log(headers);
         let request_body = request_body_for_log(&body);
+        let body_len = body.len();
         let body_audit =
             self.log_upstream_body_models(protocols.client, models, &body, "tool_bridge_stream");
         debug!(
@@ -506,7 +508,7 @@ impl Bridge {
             upstream_url = url,
             upstream_request_headers = %request_headers,
             upstream_request_body = %request_body,
-            upstream_request_body_bytes = body.len(),
+            upstream_request_body_bytes = body_len,
             "sending tool bridge upstream stream request body"
         );
         let response = match forward_request(&self.stream_client, url, headers, body)
@@ -526,7 +528,7 @@ impl Bridge {
                     upstream_url = url,
                     upstream_request_headers = %request_headers,
                     upstream_request_body = %request_body,
-                    upstream_request_body_bytes = request_body.len(),
+                    upstream_request_body_bytes = body_len,
                     elapsed_ms = started.elapsed().as_millis(),
                     error = %error,
                     "tool bridge upstream stream send failed"
@@ -551,7 +553,7 @@ impl Bridge {
                 upstream_url = url,
                 upstream_request_headers = %request_headers,
                 upstream_request_body = %request_body,
-                upstream_request_body_bytes = request_body.len(),
+                upstream_request_body_bytes = body_len,
                 elapsed_ms = started.elapsed().as_millis(),
                 "tool bridge upstream stream failed"
             );
@@ -775,8 +777,12 @@ fn request_body_model(body: &Bytes) -> Option<String> {
         })
 }
 
+/// Render an upstream request body for a debug log line. The body can be a
+/// full conversation history (tens of KB), so it is truncated to a preview —
+/// the exact byte count is logged separately as `upstream_request_body_bytes`.
 fn request_body_for_log(body: &Bytes) -> String {
-    String::from_utf8_lossy(body).to_string()
+    const BODY_LOG_LIMIT: usize = 1024;
+    truncate_for_log(&String::from_utf8_lossy(body), BODY_LOG_LIMIT)
 }
 
 fn sanitized_headers_for_log(headers: &HeaderMap) -> String {
@@ -1384,20 +1390,24 @@ fn inject_system_prompt(protocol: ApiProtocol, body: &mut Value, prompt: &str) {
     }
 }
 
-fn log_snippet(text: &str) -> String {
-    const LIMIT: usize = 500;
+fn truncate_for_log(text: &str, limit: usize) -> String {
     let mut out = String::new();
-    for ch in text.chars().take(LIMIT) {
+    for ch in text.chars().take(limit) {
         if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
             out.push(' ');
         } else {
             out.push(ch);
         }
     }
-    if text.chars().count() > LIMIT {
+    if text.chars().count() > limit {
         out.push_str("...");
     }
     out
+}
+
+fn log_snippet(text: &str) -> String {
+    const LIMIT: usize = 500;
+    truncate_for_log(text, LIMIT)
 }
 
 fn json_snippet(value: &Value) -> String {
@@ -2396,7 +2406,6 @@ mod tests {
                 auth_header: "Authorization".to_string(),
                 auth_scheme: "Bearer".to_string(),
                 headers: Default::default(),
-                bridge_tools: true,
                 models: vec!["gpt-test".to_string()],
             }],
         }
@@ -2491,7 +2500,6 @@ mod tests {
                     auth_header: "Authorization".to_string(),
                     auth_scheme: "Bearer".to_string(),
                     headers: Default::default(),
-                    bridge_tools: true,
                     models: vec!["qwen3.7-max-t".to_string()],
                 },
                 ProviderConfig {
@@ -2503,7 +2511,6 @@ mod tests {
                     auth_header: "Authorization".to_string(),
                     auth_scheme: "Bearer".to_string(),
                     headers: Default::default(),
-                    bridge_tools: true,
                     models: vec!["qwen3.7-max-chat".to_string()],
                 },
             ],
@@ -2573,7 +2580,6 @@ mod tests {
                     auth_header: "Authorization".to_string(),
                     auth_scheme: "Bearer".to_string(),
                     headers: Default::default(),
-                    bridge_tools: true,
                     models: vec!["qwen3.7-max-t".to_string()],
                 },
                 ProviderConfig {
@@ -2585,7 +2591,6 @@ mod tests {
                     auth_header: "Authorization".to_string(),
                     auth_scheme: "Bearer".to_string(),
                     headers: Default::default(),
-                    bridge_tools: true,
                     models: vec!["qwen3.7-max-chat".to_string()],
                 },
             ],
@@ -2628,92 +2633,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_can_passthrough_native_tools_without_xml_bridge() {
-        let (tx, rx) = oneshot::channel::<Bytes>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-        let capture = warp::path!("v1" / "messages")
-            .and(warp::post())
-            .and(warp::body::bytes())
-            .map(move |body: Bytes| {
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(body.clone());
-                }
-                warp::reply::json(&json!({
-                    "id": "msg_mock",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "qwen3.7-max-chat",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "stop_sequence": Value::Null,
-                    "usage": {"input_tokens": 1, "output_tokens": 1}
-                }))
-            });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(warp::serve(capture).incoming(listener).run());
-
-        let mut config = test_config(format!("http://{addr}/v1"), ApiProtocol::Messages);
-        config.providers[0].name = "piexian".to_string();
-        config.providers[0].models = vec!["qwen3.7-max-chat".to_string()];
-        config.providers[0].bridge_tools = false;
-        config.providers.push(ProviderConfig {
-            name: "futureppo".to_string(),
-            protocol: ApiProtocol::Messages,
-            upstream_protocol: None,
-            base_url: "http://127.0.0.1:9/v1".to_string(),
-            api_key: None,
-            auth_header: "Authorization".to_string(),
-            auth_scheme: "Bearer".to_string(),
-            headers: Default::default(),
-            bridge_tools: true,
-            models: vec!["qwen3.7-max-t".to_string()],
-        });
-        let bridge = Bridge::new(config);
-        let body = Bytes::from(
-            json!({
-                "model": "piexian/qwen3.7-max-chat",
-                "stream": true,
-                "max_tokens": 32,
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{
-                    "name": "dispatch",
-                    "description": "dispatch to qwen3.7-max-t or qwen3.7-max-chat",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "model": {
-                                "type": "string",
-                                "enum": ["qwen3.7-max-t", "qwen3.7-max-chat"]
-                            },
-                            "text": {"type": "string"}
-                        },
-                        "required": ["model", "text"]
-                    }
-                }]
-            })
-            .to_string(),
-        );
-
-        let reply = bridge
-            .handle(ApiProtocol::Messages, HeaderMap::new(), body)
-            .await
-            .expect("native-tool provider should receive passthrough request");
-        match reply {
-            BridgeReply::Raw { status, .. } => assert_eq!(status, StatusCode::OK),
-            BridgeReply::Json(_) => panic!("native tool passthrough should stay raw"),
-        }
-
-        let seen_body = rx.await.expect("upstream should receive request");
-        let seen_text = String::from_utf8(seen_body.to_vec()).unwrap();
-        assert!(!seen_text.contains("qwen3.7-max-t"));
-        let seen_json: Value = serde_json::from_str(&seen_text).unwrap();
-        assert_eq!(seen_json["model"], "qwen3.7-max-chat");
-        assert!(seen_json.get("tools").is_some());
-        assert!(seen_json.get("system").is_none());
-    }
-
-    #[tokio::test]
     async fn provider_auth_header_wins_over_client_header() {
         let headers = {
             let mut h = HeaderMap::new();
@@ -2746,6 +2665,64 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("configured for `responses`"));
+    }
+
+    #[test]
+    fn strips_other_configured_model_names_from_tool_definitions() {
+        // A dispatch-style tool whose schema and description reference several
+        // configured models. Only the model the request is routed to may
+        // survive; every other provider's model id must be scrubbed so the
+        // upstream can't be steered to a sibling model. This guards the
+        // stripping that `handle` runs on every bridged request.
+        let provider = |name: &str, models: &[&str]| ProviderConfig {
+            name: name.to_string(),
+            protocol: ApiProtocol::Messages,
+            upstream_protocol: None,
+            base_url: "http://upstream".to_string(),
+            api_key: None,
+            auth_header: "Authorization".to_string(),
+            auth_scheme: "Bearer".to_string(),
+            headers: Default::default(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+        };
+        let providers = vec![
+            provider("piexian", &["qwen3.7-max-chat"]),
+            provider("futureppo", &["qwen3.7-max-t"]),
+        ];
+        let mut value = json!({
+            "tools": [{
+                "name": "dispatch",
+                "description": "route to qwen3.7-max-t or qwen3.7-max-chat",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "model": {
+                            "type": "string",
+                            "enum": ["qwen3.7-max-t", "qwen3.7-max-chat"]
+                        }
+                    }
+                }
+            }]
+        });
+
+        let stripped =
+            strip_other_model_mentions_from_tools(&mut value, &providers, "qwen3.7-max-chat");
+
+        assert!(stripped.iter().any(|m| m == "qwen3.7-max-t"));
+        let text = value.to_string();
+        assert!(
+            !text.contains("qwen3.7-max-t"),
+            "other model leaked: {text}"
+        );
+        assert!(
+            text.contains("qwen3.7-max-chat"),
+            "routed model wrongly stripped: {text}"
+        );
+        let enum_models = value
+            .pointer("/tools/0/input_schema/properties/model/enum")
+            .and_then(Value::as_array)
+            .expect("enum should remain");
+        assert_eq!(enum_models, &vec![json!("qwen3.7-max-chat")]);
     }
 
     #[test]
@@ -3640,7 +3617,6 @@ mod tests {
             auth_header: "Authorization".to_string(),
             auth_scheme: "Bearer".to_string(),
             headers: Default::default(),
-            bridge_tools: true,
             models: vec!["qwen3.7-max-t".to_string()],
         });
 

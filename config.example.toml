@@ -47,13 +47,10 @@ models = [
 # Some OpenAI-compatible upstreams only support chat/completions while clients
 # call this proxy through /v1/messages. Keep protocol as the client-facing
 # endpoint and set upstream_protocol to "chat" for this supported conversion.
-# Keep bridge_tools true here. This path uses XML tool bridge, not native Chat
-# tool calls.
 [[providers]]
 name = "messages-via-chat"
 protocol = "messages"
 upstream_protocol = "chat"
 base_url = "https://api.example.com/v1"
 api_key = "your_provider_api_key_here"
-bridge_tools = true
 models = ["example-chat-model"]

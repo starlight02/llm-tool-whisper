@@ -133,7 +133,6 @@ mod tests {
                 auth_header: "Authorization".to_string(),
                 auth_scheme: "Bearer".to_string(),
                 headers: Default::default(),
-                bridge_tools: true,
                 models: vec!["fake".to_string()],
             }],
         }
