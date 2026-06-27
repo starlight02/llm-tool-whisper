@@ -26,6 +26,10 @@ fn is_stripped(name: &str) -> bool {
     STRIPPED.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
+pub(crate) fn forwards_header(name: &str) -> bool {
+    !is_stripped(name)
+}
+
 /// Build a `reqwest` request that mirrors the client request transparently.
 /// Hop-by-hop and transport-owned headers are intentionally left to the HTTP
 /// client because forwarding them across a proxy boundary is invalid.
@@ -38,7 +42,7 @@ pub fn forward_request(
     let mut builder = client.post(url).body(body);
 
     for (name, value) in headers.iter() {
-        if is_stripped(name.as_str()) {
+        if !forwards_header(name.as_str()) {
             continue;
         }
         if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {

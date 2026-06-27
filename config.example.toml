@@ -12,8 +12,8 @@ level = "info"
 [upstream]
 # Cap on establishing the TCP/TLS connection to the upstream.
 connect_timeout_secs = 20
-# End-to-end cap for one non-streaming upstream turn. Streaming turns are
-# NOT bounded by this — they run as long as the client SSE.
+# End-to-end cap for one non-streaming upstream turn. Streaming turns are not
+# bounded by this. They run as long as the client SSE.
 json_total_timeout_secs = 300
 # SSE keepalive comment frame interval. Keep this below the idle timeout
 # of any nginx / cloud load balancer fronting this proxy.
@@ -23,7 +23,7 @@ sse_keepalive_secs = 15
 name = "openai"
 protocol = "chat"
 base_url = "https://api.openai.com/v1"
-api_key = "sk-your-openai-key"
+api_key = "your_openai_api_key_here"
 models = [
   "gpt-4.1",
   "gpt-4.1-mini",
@@ -33,7 +33,7 @@ models = [
 name = "anthropic"
 protocol = "messages"
 base_url = "https://api.anthropic.com/v1"
-api_key = "sk-ant-your-anthropic-key"
+api_key = "your_anthropic_api_key_here"
 auth_header = "x-api-key"
 auth_scheme = ""
 headers = { "anthropic-version" = "2023-06-01" }
@@ -43,3 +43,17 @@ models = [
   "claude-sonnet-4-6",
   "claude-haiku-4-5",
 ]
+
+# Some OpenAI-compatible upstreams only support chat/completions while clients
+# call this proxy through /v1/messages. Keep protocol as the client-facing
+# endpoint and set upstream_protocol to "chat" for this supported conversion.
+# Keep bridge_tools true here. This path uses XML tool bridge, not native Chat
+# tool calls.
+[[providers]]
+name = "messages-via-chat"
+protocol = "messages"
+upstream_protocol = "chat"
+base_url = "https://api.example.com/v1"
+api_key = "your_provider_api_key_here"
+bridge_tools = true
+models = ["example-chat-model"]

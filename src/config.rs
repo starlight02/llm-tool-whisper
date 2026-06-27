@@ -84,7 +84,12 @@ impl Default for UpstreamConfig {
 #[derive(Clone, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
+    /// Client-facing protocol this provider is exposed under.
     pub protocol: ApiProtocol,
+    /// Upstream protocol/path used when the provider exposes a different API
+    /// shape than the client-facing endpoint. Defaults to `protocol`.
+    #[serde(default)]
+    pub upstream_protocol: Option<ApiProtocol>,
     pub base_url: String,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -94,6 +99,11 @@ pub struct ProviderConfig {
     pub auth_scheme: String,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// When true, client tool definitions are translated into XML instructions
+    /// for upstreams without native tool support. Set false for upstreams that
+    /// already accept the client protocol's native tools.
+    #[serde(default = "default_bridge_tools")]
+    pub bridge_tools: bool,
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -106,11 +116,13 @@ impl std::fmt::Debug for ProviderConfig {
         f.debug_struct("ProviderConfig")
             .field("name", &self.name)
             .field("protocol", &self.protocol)
+            .field("upstream_protocol", &self.upstream_protocol)
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("auth_header", &self.auth_header)
             .field("auth_scheme", &self.auth_scheme)
             .field("header_keys", &self.headers.keys().collect::<Vec<_>>())
+            .field("bridge_tools", &self.bridge_tools)
             .field("models", &self.models)
             .finish()
     }
@@ -141,6 +153,10 @@ fn default_auth_header() -> String {
 
 fn default_auth_scheme() -> String {
     "Bearer".to_string()
+}
+
+fn default_bridge_tools() -> bool {
+    true
 }
 
 fn default_body_limit_mb() -> u64 {

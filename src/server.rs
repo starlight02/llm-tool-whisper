@@ -127,11 +127,13 @@ mod tests {
             providers: vec![ProviderConfig {
                 name: "mock".to_string(),
                 protocol: ApiProtocol::Chat,
+                upstream_protocol: None,
                 base_url,
                 api_key: Some("k".to_string()),
                 auth_header: "Authorization".to_string(),
                 auth_scheme: "Bearer".to_string(),
                 headers: Default::default(),
+                bridge_tools: true,
                 models: vec!["fake".to_string()],
             }],
         }
@@ -179,8 +181,9 @@ mod tests {
                     }]
                 }))
             });
-        let (addr, server) = warp::serve(upstream).bind_ephemeral(([127, 0, 0, 1], 0));
-        tokio::spawn(server);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(warp::serve(upstream).incoming(listener).run());
 
         let bridge = Bridge::new(config_pointing_at(format!("http://{addr}/v1")));
         let routes = routes(bridge).recover(error::recover);

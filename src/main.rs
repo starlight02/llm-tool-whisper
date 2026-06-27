@@ -49,10 +49,15 @@ async fn main() -> ExitCode {
         models = model_count,
         "starting llm-tool-whisper"
     );
-    match warp::serve(routes).try_bind_with_graceful_shutdown(addr, shutdown_signal()) {
-        Ok((bound, server)) => {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            let bound = listener.local_addr().unwrap_or(addr);
             info!(addr = %bound, "listening");
-            server.await;
+            warp::serve(routes)
+                .incoming(listener)
+                .graceful(shutdown_signal())
+                .run()
+                .await;
             info!("llm-tool-whisper stopped");
             ExitCode::SUCCESS
         }

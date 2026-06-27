@@ -13,6 +13,7 @@ use crate::{
 pub struct Route {
     pub provider: Arc<ProviderConfig>,
     pub upstream_model: String,
+    pub upstream_protocol: ApiProtocol,
 }
 
 /// Split a client model id of the form `provider/model` into its parts.
@@ -51,15 +52,20 @@ pub fn resolve(config: &AppConfig, protocol: ApiProtocol, model: &str) -> AppRes
     }
     if provider.protocol != protocol {
         return Err(AppError::BadRequest(format!(
-            "provider `{provider_name}` is configured for `{}` requests, not `{}`",
+            "provider `{provider_name}` is configured for `{}` client requests, not `{}`; call `/v1/{}` for this provider or configure a separate provider with protocol `{}`",
             provider.protocol.as_path_label(),
+            protocol.as_path_label(),
+            provider.protocol.upstream_path(),
             protocol.as_path_label()
         )));
     }
 
+    let upstream_protocol = provider.upstream_protocol.unwrap_or(provider.protocol);
+
     Ok(Route {
         provider: Arc::new(provider.clone()),
         upstream_model,
+        upstream_protocol,
     })
 }
 

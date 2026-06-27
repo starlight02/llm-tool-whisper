@@ -12,24 +12,30 @@ or call tool backends. It only bridges representations:
 2. the proxy explains those client-provided tools to the upstream model as XML
 3. the upstream model emits one or more `<tool_call>...</tool_call>` blocks
 4. the proxy converts those XML blocks into the current protocol's native
-   tool-call response (single OR parallel calls)
+   tool-call response, with single or parallel calls
 5. the client executes the tools and sends the normal tool result(s) back
 6. the proxy converts those tool results into XML for the upstream model
 
-Requests without tools are forwarded with the original body bytes. The proxy
-does not change streaming flags or rewrite request bodies unless tool bridging
-is required.
+Requests without tools are forwarded with the original body bytes when the
+client protocol and upstream protocol match. If a provider sets
+`upstream_protocol`, the proxy translates the request and response between the
+client-facing protocol and the upstream protocol.
 
 ## API
 
-Configured providers declare exactly one protocol:
+Configured providers declare exactly one client-facing protocol:
 
-- `chat` -> `POST /v1/chat/completions`
-- `responses` -> `POST /v1/responses`
-- `messages` -> `POST /v1/messages`
+- `chat`: `POST /v1/chat/completions`
+- `responses`: `POST /v1/responses`
+- `messages`: `POST /v1/messages`
 
-There is no protocol conversion. A request to `/v1/responses` will not be routed
-to a `chat` provider.
+`protocol` controls which proxy endpoint accepts the provider. It does not
+change when `upstream_protocol` is set. A provider with `protocol = "messages"`
+only accepts `/v1/messages` client requests.
+
+`upstream_protocol` controls only the upstream path. It defaults to `protocol`.
+The supported cross-protocol path is `messages` clients to a `chat` upstream.
+Other cross-protocol combinations return `400`.
 
 `GET /v1/models` returns configured models in OpenAI list format. Model ids are
 exposed as:
@@ -39,6 +45,30 @@ provider/model
 ```
 
 `GET /health` returns `{"ok": true}` for liveness probes.
+
+## Request flow
+
+The proxy keeps the client-facing protocol stable, then chooses the upstream
+path after provider resolution.
+
+```mermaid
+flowchart TD
+    A["Client calls a proxy endpoint"] --> B["Resolve provider/model"]
+    B --> C{"Provider protocol matches client endpoint?"}
+    C -- "No" --> D["Return 400 with expected endpoint"]
+    C -- "Yes" --> E{"upstream_protocol set?"}
+    E -- "No" --> F["Use protocol as upstream protocol"]
+    E -- "Yes" --> G["Use upstream_protocol for upstream path"]
+    F --> H{"Tool bridge or protocol conversion needed?"}
+    G --> I{"Supported conversion?"}
+    I -- "No" --> D
+    I -- "Yes" --> H
+    H -- "No" --> J["Raw byte passthrough"]
+    H -- "Yes" --> K["Translate request and apply XML tool bridge"]
+    J --> L["Send upstream request"]
+    K --> L
+    L --> M["Return response in the client protocol"]
+```
 
 ## Configuration
 
@@ -57,7 +87,7 @@ level = "info"
 # Cap on establishing the TCP/TLS connection to the upstream.
 connect_timeout_secs = 20
 # End-to-end cap for one non-streaming upstream turn. Streaming turns
-# are NOT bounded by this — they run as long as the client SSE.
+# are not bounded by this. They run as long as the client SSE.
 json_total_timeout_secs = 300
 # SSE keepalive comment frame interval. Keep below the idle timeout of
 # any load balancer fronting this proxy.
@@ -67,28 +97,55 @@ sse_keepalive_secs = 15
 name = "openai"
 protocol = "chat"
 base_url = "https://api.openai.com/v1"
-api_key = "sk-your-openai-key"
+api_key = "your_openai_api_key_here"
 models = ["gpt-4.1", "gpt-4.1-mini"]
 
 [[providers]]
 name = "anthropic"
 protocol = "messages"
 base_url = "https://api.anthropic.com/v1"
-api_key = "sk-ant-your-anthropic-key"
+api_key = "your_anthropic_api_key_here"
 auth_header = "x-api-key"
 auth_scheme = ""
 headers = { "anthropic-version" = "2023-06-01" }
+# Default: true. Set false for upstreams that already accept native tools.
+bridge_tools = true
 models = [
   "claude-fable-5",
   "claude-opus-4-8",
   "claude-sonnet-4-6",
   "claude-haiku-4-5",
 ]
+
+[[providers]]
+name = "messages-via-chat"
+protocol = "messages"
+upstream_protocol = "chat"
+base_url = "https://api.example.com/v1"
+api_key = "your_provider_api_key_here"
+bridge_tools = true
+models = ["example-chat-model"]
 ```
 
 Provider auth is a default. If the client already sends the same header, the
 client header wins. This lets the proxy run with configured credentials while
 still allowing per-request overrides.
+
+`bridge_tools` controls whether tool requests are translated into XML prompt
+instructions. Keep the default `true` for upstreams without native tool support.
+Set it to `false` for upstreams that already accept the request protocol's
+native `tools` field; those requests are then passed through with only the
+provider-prefixed model id rewritten to the bare upstream model id.
+
+For `protocol = "messages"` plus `upstream_protocol = "chat"`, keep
+`bridge_tools = true`. That conversion uses XML tool bridge and does not pass
+native Chat tool calls through.
+
+`upstream_protocol` is optional and defaults to `protocol`. Same-protocol
+providers can use `chat`, `responses`, or `messages`. Cross-protocol conversion
+is implemented for `protocol = "messages"` plus `upstream_protocol = "chat"`:
+clients call `/v1/messages`, the proxy sends `POST /v1/chat/completions`
+upstream, and the response is converted back to Messages format.
 
 For Anthropic Messages requests, the client request body still needs the normal
 Anthropic fields such as `max_tokens` and `messages`; the proxy does not inject
@@ -116,7 +173,7 @@ docker run --rm -p 8787:8787 \
   ghcr.io/starlight02/llm-tool-whisper:latest
 ```
 
-Compose pulls the prebuilt image — no local build needed:
+Compose pulls the prebuilt image. No local build is needed:
 
 ```bash
 cp config.example.toml config.toml
@@ -149,8 +206,8 @@ Image builds are driven by `.github/workflows/docker.yml`. The job:
    (`latest` on `main`/`master`, `vX.Y.Z` + major on `v*` tags, and the short
    SHA on every build for traceability).
 
-No secrets to configure — the `GITHUB_TOKEN` with `packages: write` is provided
-by GitHub Actions automatically.
+No secrets need configuration. GitHub Actions provides the `GITHUB_TOKEN` with
+`packages: write`.
 
 ## Tool Bridge
 
@@ -182,10 +239,10 @@ messages into:
 </tool_result>
 ```
 
-Then it forwards the request to the same upstream protocol. Any extra metadata
-the client attached to the result (stdout / stderr / exit_code / status /
-citations / usage / etc.) is preserved verbatim inside the payload — the
-upstream model receives the full side-channel context.
+Then it forwards the request to the configured upstream protocol. Any extra
+metadata the client attached to the result (`stdout`, `stderr`, `exit_code`,
+`status`, `citations`, `usage`, and other fields) is preserved inside the
+payload, so the upstream model receives the full side-channel context.
 
 ### Robustness
 
@@ -198,18 +255,20 @@ The bridge handles several real-world failure modes:
   `message.content`, Responses `output[].message`, Messages `content[].text`).
 - A leaked `Thinking...\n> ...` preamble is lifted into the protocol's
   reasoning surface (Chat `reasoning_content`, Responses `reasoning` item,
-  Messages `thinking` block) — never dropped silently.
+  Messages `thinking` block) and is never dropped silently.
 - Streaming responses scan for `<tool_call>` markers without leaking partial
   XML to the client, and emit native tool-call SSE chunks once a complete
   block is in.
 - Argument aliases (`cmd` → `command`, `q` → `query`, `file` → `path`, …) are
   rewritten only when the tool's declared schema accepts the canonical name
-  AND does not declare the alias as a distinct property.
+  and does not declare the alias as a distinct property.
 
 ## Performance
 
-- No-tool requests are raw byte-body passthrough and stream upstream responses
-  without buffering.
+- No-tool requests use raw byte passthrough only when `protocol` and
+  `upstream_protocol` match.
+- Cross-protocol requests and tool-bridged requests serialize JSON before the
+  upstream request.
 - Two long-lived `reqwest` clients (one for streaming, one with a 5-minute
   total cap for JSON turns) reuse upstream connections.
 - Tool requests make one upstream request per client request. Tool execution
