@@ -1,6 +1,8 @@
-# xml-tool-bridge
+# LLMToolWhisper
 
-`xml-tool-bridge` is a transparent Rust proxy that lets upstream models without
+[![CI - Docker](https://github.com/starlight02/llm-tool-whisper/actions/workflows/docker.yml/badge.svg)](https://github.com/starlight02/llm-tool-whisper/actions/workflows/docker.yml)
+
+`LLMToolWhisper` is a transparent Rust proxy that lets upstream models without
 native tool calling participate in the OpenAI / Anthropic tool protocols.
 
 The client still owns tools. The proxy does not configure tools, execute tools,
@@ -45,9 +47,21 @@ Configuration is TOML only.
 ```toml
 [server]
 bind = "127.0.0.1:8787"
+# Maximum request body size in megabytes (default 32).
+body_limit_mb = 32
 
 [log]
 level = "info"
+
+[upstream]
+# Cap on establishing the TCP/TLS connection to the upstream.
+connect_timeout_secs = 20
+# End-to-end cap for one non-streaming upstream turn. Streaming turns
+# are NOT bounded by this — they run as long as the client SSE.
+json_total_timeout_secs = 300
+# SSE keepalive comment frame interval. Keep below the idle timeout of
+# any load balancer fronting this proxy.
+sse_keepalive_secs = 15
 
 [[providers]]
 name = "openai"
@@ -91,20 +105,52 @@ If no path is passed, the proxy reads `config.toml`.
 
 ## Docker
 
+Prebuilt multi-arch images (amd64 + arm64) are published to GHCR on every push
+to `main`/`master` (tagged `latest`) and on every `v*` git tag (tagged with that
+version, e.g. `v0.1.0`).
+
 ```bash
 cp config.example.toml config.toml
-docker build -t xml-tool-bridge .
 docker run --rm -p 8787:8787 \
-  -v "$PWD/config.toml:/etc/xml-tool-bridge/config.toml:ro" \
-  xml-tool-bridge
+  -v "$PWD/config.toml:/etc/llm-tool-whisper/config.toml:ro" \
+  ghcr.io/starlight02/llm-tool-whisper:latest
 ```
 
-Compose:
+Compose pulls the prebuilt image — no local build needed:
 
 ```bash
 cp config.example.toml config.toml
-docker compose up --build
+docker compose up -d
+docker compose logs -f
 ```
+
+To pin a release, set the image tag in `docker-compose.yml` or `docker run` with
+`ghcr.io/starlight02/llm-tool-whisper:v0.1.0`.
+
+### Building locally
+
+If you need a locally-built image (offline, custom patch, …):
+
+```bash
+docker build -t llm-tool-whisper .
+docker run --rm -p 8787:8787 \
+  -v "$PWD/config.toml:/etc/llm-tool-whisper/config.toml:ro" \
+  llm-tool-whisper
+```
+
+### CI
+
+Image builds are driven by `.github/workflows/docker.yml`. The job:
+
+1. Checks out the repo.
+2. Sets up Docker Buildx + QEMU for multi-arch emulation.
+3. Logs in to GHCR using the auto-provisioned `GITHUB_TOKEN`.
+4. Builds and pushes `linux/amd64,linux/arm64` with the right tags
+   (`latest` on `main`/`master`, `vX.Y.Z` + major on `v*` tags, and the short
+   SHA on every build for traceability).
+
+No secrets to configure — the `GITHUB_TOKEN` with `packages: write` is provided
+by GitHub Actions automatically.
 
 ## Tool Bridge
 
@@ -168,4 +214,3 @@ The bridge handles several real-world failure modes:
   total cap for JSON turns) reuse upstream connections.
 - Tool requests make one upstream request per client request. Tool execution
   and multi-step orchestration stay in the client.
-
