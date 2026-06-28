@@ -1,0 +1,33 @@
+# Dependabot keeps dependencies current and opens PRs automatically. Each PR
+# still runs the full docker workflow (clippy -D warnings, tests, multi-arch
+# build), so an update only lands if it stays green. The github-actions
+# ecosystem is what surfaces a fix for the lingering upload-artifact Node 20
+# deprecation the moment GitHub ships a Node 24 release.
+version: 2
+updates:
+  # Workflow action versions (actions/*, docker/*, dtolnay/*, Swatinem/*).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+
+  # Rust crate dependencies in Cargo.toml / Cargo.lock.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # Base images in the Dockerfile (rust:*-slim, debian:*-slim).
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "docker"
