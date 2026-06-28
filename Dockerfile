@@ -19,10 +19,17 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
   && rm -rf src
 
 COPY src ./src
+# Docker's COPY preserves the (older) source mtimes, so cargo's mtime-based
+# fingerprint can wrongly conclude the stub-built binary is still up to date
+# and skip recompiling the real sources. Refresh the source mtimes and drop
+# the stub artifact so the build is forced to relink the real program — and so
+# a missed rebuild fails loudly at `cp` instead of shipping the empty stub.
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
   --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
   --mount=type=cache,id=cargo-target-${TARGETARCH},target=/app/target,sharing=locked \
-  cargo build --release --locked \
+  find src -name '*.rs' -exec touch {} + \
+  && rm -f target/release/llm-tool-whisper \
+  && cargo build --release --locked \
   && cp target/release/llm-tool-whisper /usr/local/bin/llm-tool-whisper
 
 FROM debian:bookworm-slim
