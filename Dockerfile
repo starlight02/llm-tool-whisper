@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.90-slim-bookworm AS builder
+FROM rust:1.96-slim-bookworm AS builder
 
 WORKDIR /app
 ARG TARGETARCH
