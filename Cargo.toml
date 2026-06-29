@@ -1,6 +1,6 @@
 [package]
 name = "llm-tool-whisper"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ bytes = "1"
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
 futures-channel = "0.3"
 futures-util = "0.3.31"
+mimalloc = "0.1.52"
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 roxmltree = "0.21.1"
 serde = { version = "1.0.217", features = ["derive"] }
@@ -22,3 +23,11 @@ warp = { version = "0.4.3", default-features = false, features = ["server"] }
 
 [dev-dependencies]
 warp = { version = "0.4.3", default-features = false, features = ["test"] }
+
+[profile.release]
+opt-level = 3          # 最大性能优化
+lto = true             # 启用胖 LTO 链接优化，跨 crate 优化，减少体积并提升性能
+codegen-units = 1      # 限制为一个代码生成单元，获得更优的全局优化，减小体积
+panic = "abort"        # 发生 panic 时直接中止，省去 unwind 栈展开代码（显著减小体积）
+strip = true           # 去除二进制中的所有调试信息和符号表（大幅减小体积）
+
