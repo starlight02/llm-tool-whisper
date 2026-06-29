@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{ApiProtocol, ToolDefinition},
-    xml_protocol::{next_tool_fragment, parse_tool_calls, XmlToolCall},
+    xml_protocol::{XmlToolCall, next_tool_fragment, parse_tool_calls},
 };
 
 // XML markers are assembled with concat! so the contiguous literal never
@@ -183,7 +183,8 @@ impl Scanner {
                 // emit the ToolCall and continue processing any following text in
                 // the same feed without waiting for finish().
                 if let Some(frag) = next_tool_fragment(&self.buf, 0, false)
-                    && frag.end > 0 && frag.end <= self.buf.len()
+                    && frag.end > 0
+                    && frag.end <= self.buf.len()
                 {
                     let full: String = self.buf.drain(..frag.end).collect();
                     self.capturing_end = None;
@@ -629,10 +630,19 @@ mod tests {
         assert_eq!(calls[0].arguments["file_path"], "README.md");
 
         // "plan\n" before + "\nnow do more" after should have been emitted as safe text.
-        assert!(emitted.contains("plan"), "missing leading prose: {emitted:?}");
-        assert!(emitted.contains("now do more"), "trailing prose was swallowed: {emitted:?}");
+        assert!(
+            emitted.contains("plan"),
+            "missing leading prose: {emitted:?}"
+        );
+        assert!(
+            emitted.contains("now do more"),
+            "trailing prose was swallowed: {emitted:?}"
+        );
         // The XML itself must not leak.
-        assert!(!emitted.contains("<name>"), "name tag leaked as text: {emitted:?}");
+        assert!(
+            !emitted.contains("<name>"),
+            "name tag leaked as text: {emitted:?}"
+        );
     }
 
     #[test]

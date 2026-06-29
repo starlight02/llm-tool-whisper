@@ -1,0 +1,26 @@
+# lefthook.yml
+# Git hooks configuration using lefthook (https://github.com/evilmartians/lefthook)
+#
+# This replaces the previous pure-bash .githooks approach.
+# lefthook is fast, cross-platform, and has zero runtime dependencies
+# once installed.
+
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      run: cargo fmt -- --check
+      fail_text: "Formatting check failed. Run `cargo fmt` to fix."
+      glob: "{**/*.rs,Cargo.toml,Cargo.lock}"
+      stage_fixed: false
+
+    clippy:
+      run: cargo clippy --locked --all-targets -- -D warnings
+      fail_text: "Clippy found issues. Fix the warnings before committing."
+      glob: "{**/*.rs,Cargo.toml,Cargo.lock}"
+      stage_fixed: false
+
+  # Skip during merge/rebase
+  skip:
+    - merge
+    - rebase

@@ -791,17 +791,16 @@ fn parse_lenient_tool_call(fragment: &str, tools: &[ToolDefinition]) -> Option<X
     // Quick reject only for completely uninteresting fragments when no obvious
     // tool structure is present. We still let the normal lenient logic decide
     // for bare names or weird cases.
-    let looks_like_tool_structure =
-        fragment.contains("<name")
-            || fragment.contains("<arguments")
-            || fragment.contains("<args")
-            || fragment.contains("<input")
-            || fragment.contains("<parameters")
-            || fragment.contains("<parameter")
-            || fragment.contains("<invoke")
-            || fragment.contains("<function_calls")
-            || fragment.contains("</tool_call>")
-            || fragment.contains('<'); // any tag at all - let later logic decide
+    let looks_like_tool_structure = fragment.contains("<name")
+        || fragment.contains("<arguments")
+        || fragment.contains("<args")
+        || fragment.contains("<input")
+        || fragment.contains("<parameters")
+        || fragment.contains("<parameter")
+        || fragment.contains("<invoke")
+        || fragment.contains("<function_calls")
+        || fragment.contains("</tool_call>")
+        || fragment.contains('<'); // any tag at all - let later logic decide
 
     if !looks_like_tool_structure {
         // No tags whatsoever. Only continue if the whole fragment is exactly

@@ -270,3 +270,69 @@ The bridge handles several real-world failure modes:
   total cap for JSON turns) reuse upstream connections.
 - Tool requests make one upstream request per client request. Tool execution
   and multi-step orchestration stay in the client.
+
+## Development
+
+### Git Hooks (recommended)
+
+We use [lefthook](https://github.com/evilmartians/lefthook) to run `cargo fmt -- --check` and `cargo clippy --locked --all-targets -- -D warnings` automatically before every commit. These checks run in parallel. If either fails, the commit is rejected.
+
+**1. Install lefthook** (one-time, choose one method):
+
+```bash
+# macOS
+brew install lefthook
+
+# Linux / CI-friendly
+curl -sSfL https://raw.githubusercontent.com/evilmartians/lefthook/master/install.sh | sh
+
+# Using cargo-binstall (if you have it)
+cargo binstall lefthook
+
+# Other options: https://github.com/evilmartians/lefthook#install
+```
+
+**2. Enable the hooks** (run once after cloning):
+
+```bash
+./scripts/setup-hooks.sh
+```
+
+This is equivalent to:
+
+```bash
+git config --unset core.hooksPath 2>/dev/null || true
+lefthook install
+```
+
+You can also run the checks manually at any time:
+
+```bash
+# Run both checks
+lefthook run pre-commit
+
+# Or run individually
+lefthook run pre-commit format
+lefthook run pre-commit clippy
+```
+
+lefthook is fast, cross-platform, and the configuration lives in `lefthook.yml` (version controlled). This is the recommended approach over raw git hooks or Python-based frameworks.
+
+### Running checks manually
+
+You can always run the checks directly (useful in CI, containers, or if you haven't enabled hooks yet):
+
+```bash
+cargo fmt -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test
+```
+
+These are exactly the checks that run in CI and via lefthook.
+
+If lefthook is installed, you can also invoke the hook directly:
+
+```bash
+lefthook run pre-commit
+```
+
