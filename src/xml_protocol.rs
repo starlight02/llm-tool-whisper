@@ -114,6 +114,11 @@ fn push_tool_selection_guidance(prompt: &mut String, tools: &[ToolDefinition]) {
 /// A turn may legitimately contain several parallel calls; callers receive
 /// them all rather than only the first one.
 pub fn parse_tool_calls(text: &str, tools: &[ToolDefinition]) -> Vec<XmlToolCall> {
+    // Fast path for the very common case of plain text with no tags.
+    if !text.contains('<') {
+        return vec![];
+    }
+
     let mut out = Vec::new();
     let mut cursor = 0;
     while let Some(fragment) = next_tool_fragment(text, cursor, true) {
@@ -134,6 +139,11 @@ pub fn parse_tool_calls(text: &str, tools: &[ToolDefinition]) -> Vec<XmlToolCall
 }
 
 pub fn remove_tool_call_fragments(text: &str) -> String {
+    // Fast path: no tags at all means no tool fragments possible.
+    if !text.contains('<') {
+        return text.to_string();
+    }
+
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
     while let Some(fragment) = next_tool_fragment(text, cursor, true) {
@@ -144,18 +154,38 @@ pub fn remove_tool_call_fragments(text: &str) -> String {
     out
 }
 
-struct ToolFragment {
-    start: usize,
-    end: usize,
+pub(crate) struct ToolFragment {
+    pub start: usize,
+    pub end: usize,
 }
 
-fn next_tool_fragment(text: &str, cursor: usize, allow_incomplete: bool) -> Option<ToolFragment> {
+pub(crate) fn next_tool_fragment(
+    text: &str,
+    cursor: usize,
+    allow_incomplete: bool,
+) -> Option<ToolFragment> {
     let wrapped = next_wrapped_tool_fragment(text, cursor, allow_incomplete);
-    let orphan = next_orphan_tool_fragment(text, cursor, allow_incomplete);
+
+    // If we already found a wrapped fragment, only search for orphan fragments
+    // that would start *before* it. This avoids scanning far into the text
+    // for <name> tags when a normal <tool_call> was seen early.
+    let orphan = if let Some(w) = &wrapped {
+        if w.start > cursor {
+            // Search only within the prefix up to the wrapped start.
+            // Positions remain valid because we slice from the beginning.
+            next_orphan_tool_fragment(&text[..w.start], cursor, allow_incomplete)
+        } else {
+            None
+        }
+    } else {
+        next_orphan_tool_fragment(text, cursor, allow_incomplete)
+    };
+
     match (wrapped, orphan) {
-        (Some(a), Some(b)) => Some(if a.start <= b.start { a } else { b }),
-        (Some(fragment), None) | (None, Some(fragment)) => Some(fragment),
-        (None, None) => None,
+        (Some(w), Some(o)) if o.start < w.start => Some(o),
+        (Some(w), _) => Some(w),
+        (None, Some(o)) => Some(o),
+        _ => None,
     }
 }
 
@@ -187,6 +217,41 @@ fn next_wrapped_tool_fragment(
     Some(ToolFragment { start, end })
 }
 
+fn find_orphan_content_end(text: &str, content_start: usize) -> Option<usize> {
+    let suffix = &text[content_start..];
+
+    // Single scan for earliest closer or next opener.
+    let mut best: Option<usize> = None;
+
+    // Scan for </ to find closers without 5 separate finds.
+    let mut pos = 0;
+    while let Some(rel) = suffix[pos..].find("</") {
+        let at = pos + rel;
+        let after = at + 2;
+        for &closer in &["tool_call", "arguments", "args", "input", "parameters"] {
+            let cbytes = closer.as_bytes();
+            if suffix.as_bytes()[after..].starts_with(cbytes)
+                && suffix.get(after + closer.len()..after + closer.len() + 1) == Some(">")
+            {
+                let abs = content_start + at + 2 + closer.len() + 1; // </ + tag + >
+                best = Some(best.map_or(abs, |b| b.min(abs)));
+                break;
+            }
+        }
+        pos = at + 1;
+    }
+
+    // Also check for next opener (reuses the now-efficient find_next_open_tag)
+    if let Some((rel, _)) =
+        find_next_open_tag(suffix, &["tool_call", "function_calls", "invoke", "name"])
+    {
+        let abs = content_start + rel;
+        best = Some(best.map_or(abs, |b| b.min(abs)));
+    }
+
+    best
+}
+
 fn next_orphan_tool_fragment(
     text: &str,
     cursor: usize,
@@ -201,13 +266,15 @@ fn next_orphan_tool_fragment(
         let tag_end = tag_body_start + rel_tag_end;
         let name_tag = &text[tag_body_start..tag_end];
         if name_tag.contains('<') {
+            // Bad nested tag inside name open; skip past this '<name'
             search = start + 1;
             continue;
         }
 
         let body_start = tag_end + 1;
         let Some(rel_name_end) = text[body_start..].find("</name>") else {
-            search = start + 1;
+            // No closing </name>, skip past the opening <name...>
+            search = tag_end + 1;
             continue;
         };
         let after_name = body_start + rel_name_end + "</name>".len();
@@ -215,24 +282,26 @@ fn next_orphan_tool_fragment(
             &text[after_name..],
             &["arguments", "args", "input", "parameters"],
         ) else {
-            search = start + 1;
+            // No args-like tag right after </name>, skip past </name>
+            search = after_name;
             continue;
         };
         if !text[after_name..after_name + rel_args_start]
             .trim()
             .is_empty()
         {
-            search = start + 1;
+            // Junk between </name> and <args>, skip past </name>
+            search = after_name;
             continue;
         }
 
         let args_start = after_name + rel_args_start;
-        let end = if let Some(close_start) = find_close_tag_after(text, "tool_call", args_start) {
-            close_start + "</tool_call>".len()
+        let end = if let Some(e) = find_orphan_content_end(text, args_start) {
+            e
         } else if allow_incomplete {
             text.len()
         } else {
-            search = start + 1;
+            search = after_name;
             continue;
         };
         return Some(ToolFragment { start, end });
@@ -250,6 +319,13 @@ fn parse_tool_call_fragment(fragment: &str, tools: &[ToolDefinition]) -> Vec<Xml
     if let Some(calls) = parse_function_calls(fragment) {
         return calls;
     }
+
+    // Cheap pre-filter before the more expensive lenient path.
+    // If there's no sign of any tool-related structure, skip straight to empty.
+    if !fragment.contains('<') && !tools.iter().any(|t| fragment.contains(&t.name)) {
+        return vec![];
+    }
+
     parse_lenient_tool_call(fragment, tools)
         .into_iter()
         .collect()
@@ -500,11 +576,23 @@ fn outer_tag_body<'a>(fragment: &'a str, tag: &str) -> Option<&'a str> {
     let start = find_open_tag(fragment, tag)?;
     let tag_body_start = start + tag.len() + 1;
     let body_start = fragment[tag_body_start..].find('>')? + tag_body_start + 1;
-    let close_tag = format!("</{tag}>");
-    let body_end = fragment[body_start..]
-        .find(&close_tag)
-        .map(|idx| body_start + idx)
-        .unwrap_or(fragment.len());
+
+    // Find </tag> without allocating
+    let tag_bytes = tag.as_bytes();
+    let body_end = if let Some(rel) = fragment[body_start..].find("</") {
+        let candidate = body_start + rel;
+        let after = candidate + 2;
+        if fragment.as_bytes()[after..].starts_with(tag_bytes)
+            && fragment.get(after + tag.len()..after + tag.len() + 1) == Some(">")
+        {
+            candidate
+        } else {
+            fragment.len()
+        }
+    } else {
+        fragment.len()
+    };
+
     Some(&fragment[body_start..body_end])
 }
 
@@ -536,29 +624,64 @@ fn is_empty_object(value: &Value) -> bool {
 }
 
 fn find_next_open_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
-    tags.iter()
-        .filter_map(|tag| find_open_tag(text, tag).map(|start| (start, *tag)))
-        .min_by_key(|(start, _)| *start)
+    // Single left-to-right scan for '<', then check which (if any) of the tags matches.
+    // This is O(n) instead of O(k * n) where k is number of tags.
+    let mut offset = 0;
+    while let Some(found) = text[offset..].find('<') {
+        let start = offset + found;
+        let after = start + 1;
+        for &tag in tags {
+            let tag_bytes = tag.as_bytes();
+            if text.as_bytes()[after..].starts_with(tag_bytes) {
+                let next_pos = after + tag.len();
+                if let Some(next_ch) = text.get(next_pos..).and_then(|s| s.chars().next())
+                    && matches!(next_ch, '>' | '/' | ' ' | '\n' | '\r' | '\t')
+                {
+                    return Some((start, tag));
+                }
+            }
+        }
+        offset = start + 1;
+    }
+    None
 }
 
 fn find_open_tag(text: &str, tag: &str) -> Option<usize> {
-    let marker = format!("<{tag}");
+    // Avoid allocation: search for '<' then verify it is followed by the exact tag.
+    let tag_bytes = tag.as_bytes();
     let mut offset = 0;
-    while let Some(found) = text[offset..].find(&marker) {
+    while let Some(found) = text[offset..].find('<') {
         let start = offset + found;
-        let after = start + marker.len();
-        let next = text[after..].chars().next();
-        if next.is_some_and(|ch| matches!(ch, '>' | '/' | ' ' | '\n' | '\r' | '\t')) {
-            return Some(start);
+        let after = start + 1;
+        if text.as_bytes()[after..].starts_with(tag_bytes) {
+            let next_pos = after + tag.len();
+            if let Some(next_ch) = text.get(next_pos..).and_then(|s| s.chars().next())
+                && matches!(next_ch, '>' | '/' | ' ' | '\n' | '\r' | '\t')
+            {
+                return Some(start);
+            }
         }
-        offset = after;
+        offset = start + 1;
     }
     None
 }
 
 fn find_close_tag_after(text: &str, tag: &str, from: usize) -> Option<usize> {
-    let close = format!("</{tag}>");
-    text[from..].find(&close).map(|idx| from + idx)
+    // Avoid allocation: look for "</tag>" by finding '</' and verifying.
+    let tag_bytes = tag.as_bytes();
+    let mut search_start = from;
+    while let Some(rel) = text[search_start..].find("</") {
+        let candidate = search_start + rel;
+        let after_slash = candidate + 2;
+        if text.as_bytes()[after_slash..].starts_with(tag_bytes) {
+            let end_pos = after_slash + tag.len();
+            if text.get(end_pos..end_pos + 1) == Some(">") {
+                return Some(candidate);
+            }
+        }
+        search_start = candidate + 1;
+    }
+    None
 }
 
 fn xml_attribute_value(tag: &str, attr: &str) -> Option<String> {
@@ -629,7 +752,76 @@ fn xml_attribute_value(tag: &str, attr: &str) -> Option<String> {
     None
 }
 
+fn extract_simple_name(fragment: &str) -> Option<String> {
+    // Fast extraction for <name>VALUE</name> (the common orphan form).
+    // Supports CDATA inside.
+    const OPEN: &str = "<name>";
+    const CLOSE: &str = "</name>";
+    let start = fragment.find(OPEN)? + OPEN.len();
+    let end = fragment[start..].find(CLOSE)? + start;
+    let raw = fragment[start..end].trim();
+    let inner = strip_cdata(raw).unwrap_or(raw);
+    Some(unescape_xml(inner))
+}
+
+fn extract_simple_arguments(fragment: &str) -> Option<String> {
+    // Fast extraction for the first <arguments>...</arguments> (or aliases)
+    // used in the standard leaky orphan pattern.
+    for open in ["<arguments>", "<args>", "<input>", "<parameters>"] {
+        if let Some(start_rel) = fragment.find(open) {
+            let after = start_rel + open.len();
+            let close = match open {
+                "<arguments>" => "</arguments>",
+                "<args>" => "</args>",
+                "<input>" => "</input>",
+                "<parameters>" => "</parameters>",
+                _ => "</arguments>",
+            };
+            if let Some(end_rel) = fragment[after..].find(close) {
+                let raw = fragment[after..after + end_rel].trim();
+                let inner = strip_cdata_lenient(raw);
+                return Some(inner.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn parse_lenient_tool_call(fragment: &str, tools: &[ToolDefinition]) -> Option<XmlToolCall> {
+    // Quick reject only for completely uninteresting fragments when no obvious
+    // tool structure is present. We still let the normal lenient logic decide
+    // for bare names or weird cases.
+    let looks_like_tool_structure =
+        fragment.contains("<name")
+            || fragment.contains("<arguments")
+            || fragment.contains("<args")
+            || fragment.contains("<input")
+            || fragment.contains("<parameters")
+            || fragment.contains("<parameter")
+            || fragment.contains("<invoke")
+            || fragment.contains("<function_calls")
+            || fragment.contains("</tool_call>")
+            || fragment.contains('<'); // any tag at all - let later logic decide
+
+    if !looks_like_tool_structure {
+        // No tags whatsoever. Only continue if the whole fragment is exactly
+        // a known tool name (bare tool call style).
+        let trimmed = fragment.trim();
+        if !tools.iter().any(|t| t.name == trimmed) {
+            return None;
+        }
+    }
+
+    // Fast path for the most common "leaky" pattern the bridge actually
+    // instructs models to use: <name>tool</name><arguments>json</arguments>
+    // (with possible CDATA or whitespace). This avoids multiple alias scans.
+    if let Some(name) = extract_simple_name(fragment)
+        && let Some(args_text) = extract_simple_arguments(fragment)
+    {
+        let arguments = parse_arguments_text(&args_text);
+        return Some(XmlToolCall { name, arguments });
+    }
+
     if let Some(name) = tag_text_any(
         fragment,
         &["name", "tool", "tool_name", "function", "function_name"],
@@ -811,13 +1003,32 @@ fn simple_arguments(fragment: &str) -> Value {
         {
             continue;
         }
-        let close_tag = format!("</{tag}>");
-        let Some(value_end) = rest.find(&close_tag) else {
-            continue;
+
+        // Find </tag> without format allocation
+        let tag_bytes = tag.as_bytes();
+        let mut search = rest;
+        let mut value_end = None;
+
+        while let Some(rel) = search.find("</") {
+            let cand = rel;
+            let after = cand + 2;
+            if search.as_bytes()[after..].starts_with(tag_bytes)
+                && search.get(after + tag.len()..after + tag.len() + 1) == Some(">")
+            {
+                value_end = Some(cand);
+                break;
+            }
+            search = &search[cand + 1..];
+        }
+
+        let value_end = match value_end {
+            Some(v) => v,
+            None => continue,
         };
+
         let value = unescape_xml(rest[..value_end].trim());
         map.insert(tag.to_string(), Value::String(value));
-        rest = &rest[value_end + close_tag.len()..];
+        rest = &rest[value_end + 2 + tag.len() + 1..]; // skip </tag>
     }
     Value::Object(map)
 }
@@ -958,12 +1169,25 @@ fn tag_body_lenient(fragment: &str, tag: &str) -> Option<String> {
         return None;
     }
     let body_start = tag_end + 1;
-    let close_tag = format!("</{tag}>");
-    let body_end = fragment[body_start..]
-        .find(&close_tag)
-        .or_else(|| fragment[body_start..].find("</tool_call>"))
-        .map(|idx| body_start + idx)
-        .unwrap_or(fragment.len());
+
+    // Find </tag> or fallback to </tool_call> without allocating the common case
+    let tag_bytes = tag.as_bytes();
+    let body_end = if let Some(rel) = fragment[body_start..].find("</") {
+        let cand = body_start + rel;
+        let after = cand + 2;
+        if fragment.as_bytes()[after..].starts_with(tag_bytes)
+            && fragment.get(after + tag.len()..after + tag.len() + 1) == Some(">")
+        {
+            cand
+        } else if let Some(tc) = fragment[body_start..].find("</tool_call>") {
+            body_start + tc
+        } else {
+            fragment.len()
+        }
+    } else {
+        fragment.len()
+    };
+
     Some(unescape_xml(fragment[body_start..body_end].trim()))
 }
 
@@ -972,18 +1196,38 @@ fn tag_text_any(fragment: &str, tags: &[&str]) -> Option<String> {
 }
 
 fn tag_text(fragment: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = fragment.find(&open)? + open.len();
-    let end = fragment[start..].find(&close)? + start;
-    let raw = fragment[start..end].trim();
-    // Models are instructed to wrap argument bodies in CDATA. If the wrapper
-    // survived (because strict parsing failed for some other reason), strip
-    // it here so the inner JSON parses.
-    if let Some(inner) = strip_cdata(raw) {
-        return Some(inner.to_string());
+    // Allocation-light search for <tag>content</tag> using '<' scan + prefix check.
+    let tag_bytes = tag.as_bytes();
+    let mut offset = 0;
+    while let Some(lt) = fragment[offset..].find('<') {
+        let cand = offset + lt;
+        let after_lt = cand + 1;
+        if fragment.as_bytes()[after_lt..].starts_with(tag_bytes) {
+            let after_tag = after_lt + tag.len();
+            if fragment.get(after_tag..after_tag + 1) == Some(">") {
+                let content_start = after_tag + 1;
+                // Now look for </tag>
+                let mut search = content_start;
+                while let Some(sl) = fragment[search..].find("</") {
+                    let c2 = search + sl;
+                    let after_sl = c2 + 2;
+                    if fragment.as_bytes()[after_sl..].starts_with(tag_bytes)
+                        && fragment.get(after_sl + tag.len()..after_sl + tag.len() + 1) == Some(">")
+                    {
+                        let raw = fragment[content_start..c2].trim();
+                        if let Some(inner) = strip_cdata(raw) {
+                            return Some(inner.to_string());
+                        }
+                        return Some(unescape_xml(raw));
+                    }
+                    search = c2 + 1;
+                }
+                return None; // no matching close found
+            }
+        }
+        offset = cand + 1;
     }
-    Some(unescape_xml(raw))
+    None
 }
 
 fn strip_cdata(raw: &str) -> Option<&str> {
@@ -1027,21 +1271,55 @@ fn child_text<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<&'a str> {
 }
 
 fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    if !value.contains(['&', '<', '>', '"', '\'']) {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(value.len() + 8); // rough extra for entities
+    for ch in value.chars() {
+        match ch {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '"' => result.push_str("&quot;"),
+            '\'' => result.push_str("&apos;"),
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 
 fn unescape_xml(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(pos) = rest.find('&') {
+        result.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        if rest.starts_with("&amp;") {
+            result.push('&');
+            rest = &rest[5..];
+        } else if rest.starts_with("&lt;") {
+            result.push('<');
+            rest = &rest[4..];
+        } else if rest.starts_with("&gt;") {
+            result.push('>');
+            rest = &rest[4..];
+        } else if rest.starts_with("&quot;") {
+            result.push('"');
+            rest = &rest[6..];
+        } else if rest.starts_with("&apos;") {
+            result.push('\'');
+            rest = &rest[6..];
+        } else {
+            // Unknown entity or lone &, keep the '&' and advance one char
+            result.push('&');
+            rest = &rest[1..];
+        }
+    }
+    result.push_str(rest);
+    result
 }
 
 /// Escape any `]]>` sequence that would otherwise terminate the surrounding
@@ -1480,5 +1758,36 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments.get("command"), None);
         assert_eq!(calls[0].arguments["cmd"], "date");
+    }
+
+    #[test]
+    fn orphan_without_outer_wrapper_is_parsed_and_bounded() {
+        // Model completely omits the <tool_call> start tag.
+        let calls = parse_tool_calls(
+            "some text <name>Read</name><arguments>{\"file_path\":\"README.md\"}</arguments> more text",
+            &[read_tool()],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+    }
+
+    #[test]
+    fn remove_fragments_bounds_orphan_without_outer_tag() {
+        let visible = remove_tool_call_fragments(
+            "pre <name>Read</name><arguments>{\"file_path\":\"x\"}</arguments> post",
+        );
+        assert_eq!(visible, "pre  post");
+    }
+
+    #[test]
+    fn multiple_orphans_with_text_between_are_extracted_separately() {
+        let calls = parse_tool_calls(
+            "<name>Read</name><arguments>{\"file_path\":\"a\"}</arguments> middle <name>Read</name><arguments>{\"file_path\":\"b\"}</arguments>",
+            &[read_tool()],
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["file_path"], "a");
+        assert_eq!(calls[1].arguments["file_path"], "b");
     }
 }

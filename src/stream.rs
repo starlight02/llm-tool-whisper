@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{ApiProtocol, ToolDefinition},
-    xml_protocol::{XmlToolCall, parse_tool_calls},
+    xml_protocol::{next_tool_fragment, parse_tool_calls, XmlToolCall},
 };
 
 // XML markers are assembled with concat! so the contiguous literal never
@@ -16,6 +16,7 @@ const START_MARKERS: &[(&str, &str)] = &[
     ),
     (concat!('<', "invoke"), concat!("</", "invoke", ">")),
     (concat!('<', "name"), concat!("</", "tool_call", ">")),
+    (concat!('<', "arguments"), concat!("</", "arguments", ">")),
 ];
 
 #[derive(Debug)]
@@ -168,13 +169,29 @@ impl Scanner {
 
         loop {
             if let Some(end_marker) = self.capturing_end {
-                let Some(end) = self.buf.find(end_marker) else {
-                    return events;
-                };
-                let full: String = self.buf.drain(..end + end_marker.len()).collect();
-                self.capturing_end = None;
-                flush_parsed(&full, &self.tools, &mut events);
-                continue;
+                if let Some(end) = self.buf.find(end_marker) {
+                    let full: String = self.buf.drain(..end + end_marker.len()).collect();
+                    self.capturing_end = None;
+                    flush_parsed(&full, &self.tools, &mut events);
+                    continue;
+                }
+
+                // Models often leak the *inner* structure (<name> + <arguments>) while
+                // omitting the outer <tool_call> wrapper. Try the same fragment
+                // locator the non-stream parser uses; if it finds a *complete*
+                // (non-incomplete) orphan fragment, cut exactly there. This lets us
+                // emit the ToolCall and continue processing any following text in
+                // the same feed without waiting for finish().
+                if let Some(frag) = next_tool_fragment(&self.buf, 0, false)
+                    && frag.end > 0 && frag.end <= self.buf.len()
+                {
+                    let full: String = self.buf.drain(..frag.end).collect();
+                    self.capturing_end = None;
+                    flush_parsed(&full, &self.tools, &mut events);
+                    continue;
+                }
+
+                return events;
             }
 
             if let Some((start, end_marker)) = find_start_marker(&self.buf) {
@@ -221,24 +238,25 @@ fn flush_parsed(full: &str, tools: &[ToolDefinition], events: &mut Vec<ScanEvent
 }
 
 fn find_start_marker(buf: &str) -> Option<(usize, &'static str)> {
-    START_MARKERS
-        .iter()
-        .filter_map(|(start_marker, end_marker)| {
-            find_start_marker_for(buf, start_marker).map(|start| (start, *end_marker))
-        })
-        .min_by_key(|(start, _)| *start)
-}
-
-fn find_start_marker_for(buf: &str, marker: &str) -> Option<usize> {
+    // Single scan: look for '<', then see if any START_MARKER matches at that point.
     let mut offset = 0;
-    while let Some(found) = buf[offset..].find(marker) {
+    while let Some(found) = buf[offset..].find('<') {
         let start = offset + found;
-        let after = start + marker.len();
-        let next = buf[after..].chars().next()?;
-        if matches!(next, '>' | '/' | ' ' | '\n' | '\r' | '\t') {
-            return Some(start);
+        let after = start + 1;
+        for &(start_marker, end_marker) in START_MARKERS {
+            let marker_bytes = start_marker.as_bytes();
+            // start_marker is like "<tool_call" (without the < ? wait no, from concat it includes < )
+            // Actually from definition: concat!('<', "tool_call") so it is "<tool_call"
+            if buf.as_bytes()[after..].starts_with(&marker_bytes[1..]) {
+                let next_pos = after + marker_bytes.len() - 1;
+                if let Some(next_ch) = buf.get(next_pos..).and_then(|s| s.chars().next())
+                    && matches!(next_ch, '>' | '/' | ' ' | '\n' | '\r' | '\t')
+                {
+                    return Some((start, end_marker));
+                }
+            }
         }
-        offset = after;
+        offset = start + 1;
     }
     None
 }
@@ -580,5 +598,71 @@ mod tests {
             }
         }
         assert_eq!(out, "The answer is 42");
+    }
+
+    #[test]
+    fn orphan_name_arguments_without_wrapper_is_bounded_and_does_not_swallow_trailing_text() {
+        let mut s = Scanner::new(vec![read_tool()]);
+        // Model leaks only the inner name+arguments, no opening <tool_call> at all,
+        // and there is prose both before and after.
+        let input = "plan\n<name>Read</name><arguments>{\"file_path\":\"README.md\"}</arguments>\nnow do more";
+        let events = s.feed(input);
+
+        let mut emitted = String::new();
+        let mut calls = Vec::new();
+        for e in &events {
+            match e {
+                ScanEvent::Emit(t) => emitted.push_str(t),
+                ScanEvent::ToolCall(c) => calls.push(c.clone()),
+            }
+        }
+        // Finish should not be needed; the flexible detection should have cut the orphan.
+        for e in s.finish() {
+            match e {
+                ScanEvent::Emit(t) => emitted.push_str(&t),
+                ScanEvent::ToolCall(c) => calls.push(c),
+            }
+        }
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["file_path"], "README.md");
+
+        // "plan\n" before + "\nnow do more" after should have been emitted as safe text.
+        assert!(emitted.contains("plan"), "missing leading prose: {emitted:?}");
+        assert!(emitted.contains("now do more"), "trailing prose was swallowed: {emitted:?}");
+        // The XML itself must not leak.
+        assert!(!emitted.contains("<name>"), "name tag leaked as text: {emitted:?}");
+    }
+
+    #[test]
+    fn multiple_orphan_calls_with_interleaved_text_are_extracted_cleanly() {
+        let mut s = Scanner::new(vec![read_tool()]);
+        let input = "start <name>Read</name><arguments>{\"file_path\":\"a\"}</arguments> middle <name>Read</name><arguments>{\"file_path\":\"b\"}</arguments> end";
+        let events = s.feed(input);
+
+        let mut texts = Vec::new();
+        let mut calls = Vec::new();
+        for e in events {
+            match e {
+                ScanEvent::Emit(t) => texts.push(t),
+                ScanEvent::ToolCall(c) => calls.push(c),
+            }
+        }
+        for e in s.finish() {
+            match e {
+                ScanEvent::Emit(t) => texts.push(t),
+                ScanEvent::ToolCall(c) => calls.push(c),
+            }
+        }
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["file_path"], "a");
+        assert_eq!(calls[1].arguments["file_path"], "b");
+
+        let joined = texts.join("");
+        assert!(joined.contains("start"));
+        assert!(joined.contains("middle"));
+        assert!(joined.contains("end"));
     }
 }
