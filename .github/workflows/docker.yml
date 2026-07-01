@@ -60,41 +60,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="$(python3 - <<'PY'
-          import pathlib
-          import tomllib
-
-          data = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-          print(data["package"]["version"])
-          PY
-          )"
+          version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')"
           tag="v${version}"
-          before="${{ github.event.before }}"
-          old_version=""
-
-          if [[ -n "$before" && ! "$before" =~ ^0+$ ]] && git cat-file -e "$before:Cargo.toml" 2>/dev/null; then
-            old_version="$(git show "$before:Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')"
-          fi
-
-          version_changed=false
-          if [[ "$old_version" != "$version" ]]; then
-            version_changed=true
-          fi
 
           tag_sha=""
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            tag_sha="$(git rev-list -n 1 "$tag")"
+            tag_sha="$(git rev-parse "${tag}^{commit}")"
           fi
 
           if [[ -n "$tag_sha" && "$tag_sha" == "${{ github.sha }}" ]]; then
             echo "Version tag ${tag} already points at this commit."
             echo "version_tag=${tag}" >> "$GITHUB_OUTPUT"
           elif [[ -n "$tag_sha" ]]; then
-            if [[ "$version_changed" == "true" ]]; then
-              echo "::error::Cargo.toml version ${version} changed, but tag ${tag} already points at ${tag_sha}. Bump the version or move/delete the existing tag intentionally."
-              exit 1
-            fi
-            echo "Version ${version} is already tagged at ${tag_sha}; not creating a new tag for this non-version push."
+            echo "::error::Cargo.toml version ${version} is already tagged at ${tag_sha}; bump Cargo.toml before releasing another commit."
+            exit 1
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -102,10 +81,6 @@ jobs:
             git push origin "refs/tags/${tag}"
             echo "Created version tag ${tag}."
             echo "version_tag=${tag}" >> "$GITHUB_OUTPUT"
-          fi
-
-          if [[ -n "${tag_sha}" && "${tag_sha}" != "${{ github.sha }}" && "$version_changed" != "true" ]]; then
-            exit 0
           fi
 
           if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
