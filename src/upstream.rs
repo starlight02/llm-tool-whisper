@@ -86,15 +86,15 @@ pub async fn complete_turn_json(
     let value = serde_json::from_slice::<Value>(&body).map_err(|err| {
         AppError::Upstream(format!(
             "invalid upstream JSON body: {err}: {}",
-            String::from_utf8_lossy(&body)
+            body_snippet(&body)
         ))
     })?;
-    let text = extract_text(protocol, &value)?;
+    let text = extract_text(protocol, &value).ok();
     Ok(JsonTurn {
         status,
         headers,
         body,
-        text: Some(text),
+        text,
     })
 }
 
@@ -112,9 +112,9 @@ where
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(index) = buffer.find("\n\n") {
+        while let Some((index, separator_len)) = find_sse_separator(&buffer) {
             let frame = buffer[..index].to_string();
-            buffer = buffer[index + 2..].to_string();
+            buffer = buffer[index + separator_len..].to_string();
             if let Some(delta) = parse_sse_frame(protocol, &frame)?
                 && !delta.is_empty()
             {
@@ -154,6 +154,34 @@ fn parse_sse_frame(protocol: ApiProtocol, frame: &str) -> AppResult<Option<Strin
     let value: Value = serde_json::from_str(&data)
         .map_err(|err| AppError::Upstream(format!("invalid upstream SSE JSON: {err}: {data}")))?;
     Ok(extract_stream_delta(protocol, &value))
+}
+
+fn find_sse_separator(text: &str) -> Option<(usize, usize)> {
+    let lf = text.find("\n\n").map(|idx| (idx, 2));
+    let crlf = text.find("\r\n\r\n").map(|idx| (idx, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn body_snippet(body: &Bytes) -> String {
+    const LIMIT: usize = 500;
+    let text = String::from_utf8_lossy(body);
+    let mut out = String::new();
+    for ch in text.chars().take(LIMIT) {
+        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    if text.chars().count() > LIMIT {
+        out.push_str("...");
+    }
+    out
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,5 +257,21 @@ mod tests {
     fn leaves_normal_text_alone() {
         assert!(split_leading_thinking("Thinking is useful.\n\nAnswer").is_none());
         assert!(split_leading_thinking("Plain answer").is_none());
+    }
+
+    #[test]
+    fn finds_crlf_sse_separator() {
+        assert_eq!(find_sse_separator("data: {}\r\n\r\nnext"), Some((8, 4)));
+        assert_eq!(find_sse_separator("data: {}\n\nnext"), Some((8, 2)));
+    }
+
+    #[test]
+    fn invalid_json_body_snippet_is_bounded() {
+        let body = Bytes::from(format!("{}{}", "x".repeat(700), "\u{0001}"));
+        let snippet = body_snippet(&body);
+
+        assert!(snippet.len() < 520);
+        assert!(snippet.ends_with("..."));
+        assert!(!snippet.contains('\u{0001}'));
     }
 }

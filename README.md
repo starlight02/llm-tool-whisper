@@ -124,9 +124,10 @@ api_key = "your_provider_api_key_here"
 models = ["example-chat-model"]
 ```
 
-Provider auth is a default. If the client already sends the same header, the
-client header wins. This lets the proxy run with configured credentials while
-still allowing per-request overrides.
+Provider auth is authoritative when `api_key` is configured. The proxy removes
+common client auth headers and sends the configured provider credential instead.
+Static `headers` entries are defaults and do not overwrite headers already sent
+by the client.
 
 Tool definitions in a request are always translated into XML prompt
 instructions before being sent upstream; the model's XML tool calls are then
@@ -138,6 +139,11 @@ providers can use `chat`, `responses`, or `messages`. Cross-protocol conversion
 is implemented for `protocol = "messages"` plus `upstream_protocol = "chat"`:
 clients call `/v1/messages`, the proxy sends `POST /v1/chat/completions`
 upstream, and the response is converted back to Messages format.
+Text blocks are converted to Chat text content. Messages image blocks using
+`source.type = "base64"` or `source.type = "url"` are converted to Chat
+`image_url` content parts. Messages `source.type = "file"` images and document
+blocks are rejected because Chat Completions has no lossless equivalent in this
+conversion path.
 
 For Anthropic Messages requests, the client request body still needs the normal
 Anthropic fields such as `max_tokens` and `messages`; the proxy does not inject
@@ -155,8 +161,9 @@ If no path is passed, the proxy reads `config.toml`.
 ## Docker
 
 Prebuilt multi-arch images (amd64 + arm64) are published to GHCR on every push
-to `main`/`master` (tagged `latest`) and on every `v*` git tag (tagged with that
-version, e.g. `v0.1.0`).
+to `main`/`master` (tagged `latest`) and on every release tag. CI reads the
+`[package].version` from `Cargo.toml` and creates `vX.Y.Z` automatically when a
+new version lands on `main`/`master`.
 
 ```bash
 cp config.example.toml config.toml
@@ -196,15 +203,19 @@ merged into one multi-arch manifest:
 1. Checks out the repo.
 2. Builds `linux/amd64` on `ubuntu-latest` and `linux/arm64` on the native
    `ubuntu-24.04-arm` runner, in parallel.
-3. On push/tag, each leg logs in to GHCR (auto-provisioned `GITHUB_TOKEN`) and
+3. On `main`/`master` push, CI reads `Cargo.toml`, creates `vX.Y.Z` if that
+   version is not already tagged, and fails if the new version points at an
+   existing tag on another commit. This prevents accidental version reuse.
+4. On push/tag, each leg logs in to GHCR (auto-provisioned `GITHUB_TOKEN`) and
    pushes a digest-only image; a final `merge` job stitches the digests into one
-   manifest and applies the tags (`latest` on `main`/`master`, `vX.Y.Z` + major
-   on `v*` tags, and the short SHA on every build for traceability).
-4. On pull requests nothing is pushed — both arches are built into the cache
+   manifest and applies the tags (`latest` on `main`/`master`, `vX.Y.Z`, major /
+   minor tags for plain semver versions, and the short SHA for traceability).
+5. On pull requests nothing is pushed — both arches are built into the cache
    only, to prove the image still compiles.
 
 No secrets need configuration. GitHub Actions provides the `GITHUB_TOKEN` with
-`packages: write`.
+`contents: write` for version tag creation and `packages: write` for GHCR
+publishing.
 
 ## Tool Bridge
 
@@ -335,4 +346,3 @@ If lefthook is installed, you can also invoke the hook directly:
 ```bash
 lefthook run pre-commit
 ```
-

@@ -2,7 +2,11 @@ use std::convert::Infallible;
 
 use serde_json::json;
 use thiserror::Error;
-use warp::{Rejection, Reply, http::StatusCode};
+use warp::{
+    Rejection, Reply,
+    http::StatusCode,
+    reject::{LengthRequired, MethodNotAllowed, PayloadTooLarge},
+};
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -50,12 +54,23 @@ pub fn render(error: &AppError) -> warp::reply::Response {
 /// Catch-all for routing-level rejections (404 / method mismatch / body too
 /// large). Application errors are rendered inside the handler — they do not
 /// reach this filter.
-pub async fn recover(_rejection: Rejection) -> Result<warp::reply::Response, Infallible> {
+pub async fn recover(rejection: Rejection) -> Result<warp::reply::Response, Infallible> {
+    let (status, message) = if rejection.find::<PayloadTooLarge>().is_some() {
+        (StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+    } else if rejection.find::<LengthRequired>().is_some() {
+        (StatusCode::LENGTH_REQUIRED, "content-length required")
+    } else if rejection.find::<MethodNotAllowed>().is_some() {
+        (StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+    } else if rejection.is_not_found() {
+        (StatusCode::NOT_FOUND, "not found")
+    } else {
+        (StatusCode::BAD_REQUEST, "bad request")
+    };
     let body = warp::reply::json(&json!({
         "error": {
-            "message": "not found",
-            "type": "404",
+            "message": message,
+            "type": status.as_str(),
         }
     }));
-    Ok(warp::reply::with_status(body, StatusCode::NOT_FOUND).into_response())
+    Ok(warp::reply::with_status(body, status).into_response())
 }

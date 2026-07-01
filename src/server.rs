@@ -282,4 +282,40 @@ mod tests {
         assert!(!got.is_empty());
         assert!(got.chars().all(|c| c.is_ascii_alphanumeric()));
     }
+
+    #[tokio::test]
+    async fn routes_report_body_limit_as_413() {
+        let mut config = config_pointing_at("http://127.0.0.1:1".to_string());
+        config.body_limit_bytes = 8;
+        let bridge = Bridge::new(config);
+        let routes = routes(bridge).recover(error::recover);
+
+        let resp = request()
+            .method("POST")
+            .path("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(r#"{"too":"large"}"#)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["error"]["type"], "413");
+    }
+
+    #[tokio::test]
+    async fn routes_report_method_mismatch_as_405() {
+        let bridge = Bridge::new(config_pointing_at("http://127.0.0.1:1".to_string()));
+        let routes = routes(bridge).recover(error::recover);
+
+        let resp = request()
+            .method("GET")
+            .path("/v1/chat/completions")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["error"]["type"], "405");
+    }
 }

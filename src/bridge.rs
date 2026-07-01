@@ -298,13 +298,10 @@ impl Bridge {
         }
 
         if stream {
-            // Stream: rewrite each SSE frame's model to client_model, otherwise passthrough bytes.
+            // Stream: rewrite complete SSE frames' model to client_model,
+            // otherwise passthrough bytes.
             let client_model = models.client.to_string();
-            let stream = response.bytes_stream().map(move |r| {
-                let bytes = r.map_err(|e| std::io::Error::other(e.to_string()))?;
-                let rewritten = rewrite_sse_model(&bytes, &client_model);
-                Ok::<_, std::io::Error>(rewritten)
-            });
+            let stream = rewrite_sse_model_stream(response.bytes_stream(), client_model);
             let body = raw_body_stream(stream);
             Ok(BridgeReply::Raw {
                 status,
@@ -415,9 +412,25 @@ impl Bridge {
             });
         }
 
-        let text = turn.text.ok_or_else(|| {
-            AppError::Upstream("upstream response did not contain text".to_string())
-        })?;
+        let Some(text) = turn.text else {
+            info!(
+                protocol = protocols.client.as_path_label(),
+                client_model = models.client,
+                model = models.upstream,
+                "tool bridge upstream returned no extractable text"
+            );
+            let body = structure_response_body(
+                protocols.client,
+                protocols.upstream,
+                turn.body,
+                models.client,
+            );
+            return Ok(BridgeReply::Raw {
+                status,
+                headers: response_headers,
+                body: raw_body_once(body),
+            });
+        };
         let calls = parse_tool_calls(&text, &tools);
         if calls.is_empty() {
             info!(
@@ -991,7 +1004,7 @@ fn translate_request_body(
     }
 
     match (protocol, upstream_protocol) {
-        (ApiProtocol::Messages, ApiProtocol::Chat) => Ok(messages_request_to_chat_request(value)),
+        (ApiProtocol::Messages, ApiProtocol::Chat) => messages_request_to_chat_request(value),
         _ => Err(AppError::BadRequest(format!(
             "provider upstream_protocol `{}` is not supported for `{}` client requests",
             upstream_protocol.as_path_label(),
@@ -1000,16 +1013,16 @@ fn translate_request_body(
     }
 }
 
-fn messages_request_to_chat_request(mut value: Value) -> Value {
+fn messages_request_to_chat_request(mut value: Value) -> AppResult<Value> {
     let Some(obj) = value.as_object_mut() else {
-        return value;
+        return Ok(value);
     };
 
     let system = obj.remove("system");
     let messages = obj.remove("messages").unwrap_or_else(|| json!([]));
     let mut chat_messages = Vec::new();
     if let Some(system) = system {
-        let text = messages_content_to_text(&system);
+        let text = messages_content_to_text(&system, "system")?;
         if !text.is_empty() {
             chat_messages.push(json!({"role": "system", "content": text}));
         }
@@ -1024,6 +1037,7 @@ fn messages_request_to_chat_request(mut value: Value) -> Value {
             let content = item
                 .get("content")
                 .map(messages_chat_content)
+                .transpose()?
                 .unwrap_or_else(|| json!(""));
             chat_messages.push(json!({"role": role, "content": content}));
         }
@@ -1036,19 +1050,201 @@ fn messages_request_to_chat_request(mut value: Value) -> Value {
         obj.insert("stop".to_string(), stop_sequences);
     }
     normalize_messages_tools_for_chat(obj);
-    value
+    Ok(value)
 }
 
-fn messages_chat_content(content: &Value) -> Value {
+fn messages_chat_content(content: &Value) -> AppResult<Value> {
     match content {
-        Value::String(_) => content.clone(),
-        Value::Array(_) | Value::Object(_) => json!(messages_content_to_text(content)),
-        _ => json!(""),
+        Value::String(_) => Ok(content.clone()),
+        Value::Array(items) => messages_content_array_to_chat_content(items, "messages[].content"),
+        Value::Object(_) => messages_content_object_to_chat_content(content, "messages[].content"),
+        _ => Ok(json!("")),
     }
 }
 
-fn messages_content_to_text(content: &Value) -> String {
-    content_to_text(content).trim().to_string()
+fn messages_content_array_to_chat_content(items: &[Value], context: &str) -> AppResult<Value> {
+    let mut parts = Vec::new();
+    let mut text_only = true;
+
+    for item in items {
+        let part = messages_content_part_to_chat_part(item, context)?;
+        if part
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "text")
+        {
+            text_only = false;
+        }
+        parts.push(part);
+    }
+
+    if text_only {
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+        Ok(json!(text))
+    } else {
+        Ok(Value::Array(parts))
+    }
+}
+
+fn messages_content_object_to_chat_content(content: &Value, context: &str) -> AppResult<Value> {
+    let Some(kind) = content.get("type").and_then(Value::as_str) else {
+        if let Some(text) = content
+            .get("text")
+            .or_else(|| content.get("input_text"))
+            .or_else(|| content.get("output_text"))
+            .and_then(Value::as_str)
+        {
+            return Ok(json!(text.trim()));
+        }
+        if let Some(inner) = content.get("content") {
+            return messages_chat_content(inner);
+        }
+        return Err(AppError::BadRequest(format!(
+            "{context} contains an unsupported object content block for chat upstream conversion"
+        )));
+    };
+
+    match kind {
+        "text" => Ok(json!(
+            content
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+        )),
+        "image" => Ok(Value::Array(vec![messages_image_to_chat_part(
+            content, context,
+        )?])),
+        _ => Err(AppError::BadRequest(format!(
+            "{context} contains unsupported `{kind}` content block for chat upstream conversion"
+        ))),
+    }
+}
+
+fn messages_content_part_to_chat_part(part: &Value, context: &str) -> AppResult<Value> {
+    let Some(kind) = part.get("type").and_then(Value::as_str) else {
+        return Err(AppError::BadRequest(format!(
+            "{context} contains a content block without `type`; cannot translate to chat upstream"
+        )));
+    };
+
+    match kind {
+        "text" => Ok(json!({
+            "type": "text",
+            "text": part.get("text").and_then(Value::as_str).unwrap_or_default(),
+        })),
+        "image" => messages_image_to_chat_part(part, context),
+        _ => Err(AppError::BadRequest(format!(
+            "{context} contains unsupported `{kind}` content block for chat upstream conversion"
+        ))),
+    }
+}
+
+fn messages_image_to_chat_part(part: &Value, context: &str) -> AppResult<Value> {
+    let source = part.get("source").ok_or_else(|| {
+        AppError::BadRequest(format!("{context} image block is missing `source`"))
+    })?;
+    let source_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest(format!("{context} image source is missing `type`")))?;
+
+    let url = match source_type {
+        "base64" => {
+            let media_type = required_non_empty_str(source, "media_type", context)?;
+            let data = required_non_empty_str(source, "data", context)?;
+            format!("data:{media_type};base64,{data}")
+        }
+        "url" => required_non_empty_str(source, "url", context)?.to_string(),
+        "file" => {
+            return Err(AppError::BadRequest(format!(
+                "{context} image source `file` cannot be translated to chat upstream image_url; use `url` or `base64`"
+            )));
+        }
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "{context} contains unsupported image source `{other}` for chat upstream conversion"
+            )));
+        }
+    };
+
+    let mut image_url = Map::new();
+    image_url.insert("url".to_string(), json!(url));
+    if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+        image_url.insert("detail".to_string(), json!(detail));
+    }
+
+    Ok(json!({
+        "type": "image_url",
+        "image_url": Value::Object(image_url),
+    }))
+}
+
+fn required_non_empty_str<'a>(value: &'a Value, key: &str, context: &str) -> AppResult<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "{context} image source is missing non-empty `{key}`"
+            ))
+        })
+}
+
+fn messages_content_to_text(content: &Value, context: &str) -> AppResult<String> {
+    match content {
+        Value::String(text) => Ok(text.trim().to_string()),
+        Value::Array(items) => {
+            let mut text = Vec::new();
+            for item in items {
+                let Some(kind) = item.get("type").and_then(Value::as_str) else {
+                    return Err(AppError::BadRequest(format!(
+                        "{context} contains a content block without `type`; cannot translate to chat upstream"
+                    )));
+                };
+                if kind != "text" {
+                    return Err(AppError::BadRequest(format!(
+                        "{context} contains unsupported `{kind}` content block for chat upstream conversion"
+                    )));
+                }
+                if let Some(part_text) = item.get("text").and_then(Value::as_str)
+                    && !part_text.is_empty()
+                {
+                    text.push(part_text.to_string());
+                }
+            }
+            Ok(text.join("\n").trim().to_string())
+        }
+        Value::Object(map) => {
+            let kind = map.get("type").and_then(Value::as_str);
+            if kind.is_some_and(|kind| kind != "text") {
+                return Err(AppError::BadRequest(format!(
+                    "{context} contains unsupported `{}` content block for chat upstream conversion",
+                    kind.unwrap_or_default()
+                )));
+            }
+            if kind.is_none()
+                && !map.contains_key("text")
+                && !map.contains_key("input_text")
+                && !map.contains_key("output_text")
+                && !map.contains_key("content")
+            {
+                return Err(AppError::BadRequest(format!(
+                    "{context} contains an unsupported object content block for chat upstream conversion"
+                )));
+            }
+            Ok(content_to_text(content).trim().to_string())
+        }
+        _ => Ok(String::new()),
+    }
 }
 
 fn normalize_messages_tools_for_chat(obj: &mut Map<String, Value>) {
@@ -1709,6 +1905,32 @@ fn chat_response_to_messages_body(body: Bytes, client_model: &str) -> Bytes {
             content.push(json!({"type": "text", "text": text}));
         }
     }
+    if let Some(tool_calls) = value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+    {
+        for call in tool_calls {
+            let Some(name) = call.pointer("/function/name").and_then(Value::as_str) else {
+                continue;
+            };
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+            let input = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or_else(|| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }));
+        }
+    }
     let usage = chat_usage_to_messages_usage(value.get("usage"));
     let response = json!({
         "id": id,
@@ -2305,17 +2527,106 @@ fn rewrite_json_model(body: &Bytes, client_model: &str) -> Bytes {
         .unwrap_or_else(|_| body.clone())
 }
 
-/// Rewrite "model" inside SSE frames of the form `data: {json}\n\n`.
-/// Non-JSON frames (e.g. comments, [DONE]) are passed through unchanged.
-/// Partial/split frames are forwarded as-is (will be rewritten when complete).
-fn rewrite_sse_model(bytes: &Bytes, client_model: &str) -> Bytes {
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return bytes.clone(),
-    };
-    if text.trim().is_empty() {
-        return bytes.clone();
+fn rewrite_sse_model_stream<S>(
+    upstream: S,
+    client_model: String,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    let upstream = Box::pin(upstream);
+    stream::unfold(
+        (upstream, SseModelRewriter::new(client_model), false),
+        |(mut upstream, mut rewriter, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                match upstream.next().await {
+                    Some(Ok(bytes)) => {
+                        let rewritten = rewriter.push(&bytes);
+                        if !rewritten.is_empty() {
+                            return Some((Ok(rewritten), (upstream, rewriter, false)));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        return Some((
+                            Err(std::io::Error::other(error.to_string())),
+                            (upstream, rewriter, true),
+                        ));
+                    }
+                    None => {
+                        let tail = rewriter.finish();
+                        if tail.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(tail), (upstream, rewriter, true)));
+                    }
+                }
+            }
+        },
+    )
+}
+
+struct SseModelRewriter {
+    client_model: String,
+    pending: Vec<u8>,
+}
+
+impl SseModelRewriter {
+    fn new(client_model: String) -> Self {
+        Self {
+            client_model,
+            pending: Vec::new(),
+        }
     }
+
+    fn push(&mut self, bytes: &Bytes) -> Bytes {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while let Some((frame_end, separator_len)) = find_sse_separator_bytes(&self.pending) {
+            let frame = self.pending.drain(..frame_end).collect::<Vec<_>>();
+            let separator = self.pending.drain(..separator_len).collect::<Vec<_>>();
+            out.extend(rewrite_sse_frame_bytes(&frame, &self.client_model));
+            out.extend(separator);
+        }
+        Bytes::from(out)
+    }
+
+    fn finish(&mut self) -> Bytes {
+        if self.pending.is_empty() {
+            return Bytes::new();
+        }
+        let frame = std::mem::take(&mut self.pending);
+        Bytes::from(rewrite_sse_frame_bytes(&frame, &self.client_model))
+    }
+}
+
+fn find_sse_separator_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_bytes(bytes, b"\n\n").map(|idx| (idx, 2));
+    let crlf = find_bytes(bytes, b"\r\n\r\n").map(|idx| (idx, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn rewrite_sse_frame_bytes(frame: &[u8], client_model: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return frame.to_vec();
+    };
+    rewrite_sse_frame_text(text, client_model).into_bytes()
+}
+
+fn rewrite_sse_frame_text(text: &str, client_model: &str) -> String {
     let mut out = String::new();
     for frame in text.split("\n\n") {
         if frame.trim().is_empty() {
@@ -2358,11 +2669,7 @@ fn rewrite_sse_model(bytes: &Bytes, client_model: &str) -> Bytes {
         }
         out.push_str(&out_frame);
     }
-    // If the original ended with a complete terminator, keep the framing tidy.
-    if (text.ends_with("\n\n") || text.ends_with("\r\n\r\n")) && !out.ends_with("\n\n") {
-        out.push_str("\n\n");
-    }
-    Bytes::from(out)
+    out
 }
 
 fn rewrite_model_in_value(value: &mut Value, client_model: &str) {
@@ -2723,6 +3030,168 @@ mod tests {
             .and_then(Value::as_array)
             .expect("enum should remain");
         assert_eq!(enum_models, &vec![json!("qwen3.7-max-chat")]);
+    }
+
+    #[test]
+    fn sse_model_rewriter_rewrites_split_frames() {
+        let mut rewriter = SseModelRewriter::new("mock/gpt-test".to_string());
+
+        assert!(
+            rewriter
+                .push(&Bytes::from_static(b"data: {\"model\":\"gpt"))
+                .is_empty()
+        );
+        let out = rewriter.push(&Bytes::from_static(
+            b"-test\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n",
+        ));
+        let text = String::from_utf8(out.to_vec()).unwrap();
+
+        assert!(text.contains("\"model\":\"mock/gpt-test\""), "{text}");
+        assert!(!text.contains("\"model\":\"gpt-test\""), "{text}");
+        assert!(text.ends_with("\r\n\r\n"));
+        assert!(rewriter.finish().is_empty());
+    }
+
+    #[test]
+    fn messages_to_chat_converts_base64_and_url_images() {
+        let value = json!({
+            "model": "mock/gpt-test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aW1n"
+                        },
+                        "detail": "low"
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/cat.png"
+                        }
+                    }
+                ]
+            }]
+        });
+
+        let converted = messages_request_to_chat_request(value).unwrap();
+        let content = converted
+            .pointer("/messages/0/content")
+            .and_then(Value::as_array)
+            .expect("chat content parts");
+
+        assert_eq!(content[0], json!({"type": "text", "text": "look"}));
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aW1n");
+        assert_eq!(content[1]["image_url"]["detail"], "low");
+        assert_eq!(content[2]["type"], "image_url");
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "https://example.com/cat.png"
+        );
+    }
+
+    #[test]
+    fn messages_to_chat_converts_single_image_object() {
+        let value = json!({
+            "model": "mock/gpt-test",
+            "messages": [{
+                "role": "user",
+                "content": {
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": "https://example.com/single.png"
+                    }
+                }
+            }]
+        });
+
+        let converted = messages_request_to_chat_request(value).unwrap();
+        let content = converted
+            .pointer("/messages/0/content")
+            .and_then(Value::as_array)
+            .expect("single image object becomes chat parts");
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "https://example.com/single.png"
+        );
+    }
+
+    #[test]
+    fn messages_to_chat_keeps_text_only_array_as_string() {
+        let value = json!({
+            "model": "mock/gpt-test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": "world"}
+                ]
+            }]
+        });
+
+        let converted = messages_request_to_chat_request(value).unwrap();
+
+        assert_eq!(
+            converted.pointer("/messages/0/content"),
+            Some(&json!("hello\nworld"))
+        );
+    }
+
+    #[test]
+    fn messages_to_chat_rejects_unsupported_non_text_blocks() {
+        let value = json!({
+            "model": "mock/gpt-test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "read this"},
+                    {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}}
+                ]
+            }]
+        });
+
+        let error = messages_request_to_chat_request(value).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported `document` content block"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn messages_to_chat_rejects_file_image_sources() {
+        let value = json!({
+            "model": "mock/gpt-test",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {"type": "file", "file_id": "file_123"}
+                }]
+            }]
+        });
+
+        let error = messages_request_to_chat_request(value).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("image source `file` cannot be translated"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3672,6 +4141,178 @@ mod tests {
             captured.lock().unwrap().is_some(),
             "chat upstream was called"
         );
+    }
+
+    #[tokio::test]
+    async fn messages_client_can_send_images_to_chat_upstream() {
+        let (tx, rx) = oneshot::channel::<Bytes>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let route = warp::path!("v1" / "chat" / "completions")
+            .and(warp::post())
+            .and(warp::body::bytes())
+            .map(move |body: Bytes| {
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(body.clone());
+                }
+                warp::reply::json(&json!({
+                    "id": "chatcmpl-image",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "image received"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(warp::serve(route).incoming(listener).run());
+
+        let mut config = test_config(format!("http://{addr}/v1"), ApiProtocol::Messages);
+        config.providers[0].upstream_protocol = Some(ApiProtocol::Chat);
+        let bridge = Bridge::new(config);
+        let body = Bytes::from(
+            json!({
+                "model": "mock/gpt-test",
+                "max_tokens": 32,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is in this image?"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": "anBlZw=="
+                            }
+                        }
+                    ]
+                }]
+            })
+            .to_string(),
+        );
+
+        let reply = bridge
+            .handle(ApiProtocol::Messages, HeaderMap::new(), body)
+            .await
+            .expect("messages image should translate to chat upstream");
+        match reply {
+            BridgeReply::Raw {
+                status: StatusCode::OK,
+                ..
+            } => {}
+            BridgeReply::Raw { status, .. } => panic!("unexpected status: {status}"),
+            BridgeReply::Json(_) => panic!("protocol conversion without XML stays raw"),
+        }
+
+        let sent = rx.await.expect("chat upstream should receive request");
+        let sent: Value = serde_json::from_slice(&sent).unwrap();
+        let content = sent
+            .pointer("/messages/0/content")
+            .and_then(Value::as_array)
+            .expect("chat content parts");
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "what is in this image?"})
+        );
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,anBlZw=="
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_chat_upstream_native_tool_call_is_returned_as_tool_use() {
+        let route = warp::path!("v1" / "chat" / "completions")
+            .and(warp::post())
+            .map(|| {
+                warp::reply::json(&json!({
+                    "id": "chatcmpl-native",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": Value::Null,
+                            "tool_calls": [{
+                                "id": "call_native",
+                                "type": "function",
+                                "function": {
+                                    "name": "dispatch",
+                                    "arguments": "{\"text\":\"hi\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }))
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(warp::serve(route).incoming(listener).run());
+
+        let mut config = test_config(format!("http://{addr}/v1"), ApiProtocol::Messages);
+        config.providers[0].upstream_protocol = Some(ApiProtocol::Chat);
+        let bridge = Bridge::new(config);
+        let body = Bytes::from(
+            json!({
+                "model": "mock/gpt-test",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "call dispatch"}],
+                "tools": [{
+                    "name": "dispatch",
+                    "description": "dispatch text",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"]
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let reply = bridge
+            .handle(ApiProtocol::Messages, HeaderMap::new(), body)
+            .await
+            .expect("native chat tool call should be structured for messages client");
+        let body = match reply {
+            BridgeReply::Raw {
+                status: StatusCode::OK,
+                body,
+                ..
+            } => body,
+            BridgeReply::Raw { status, .. } => panic!("unexpected status: {status}"),
+            BridgeReply::Json(_) => panic!("native upstream tool call should use raw fallback"),
+        };
+        use futures_util::TryStreamExt;
+        let bytes = body
+            .map_ok(|b| b.to_vec())
+            .try_concat()
+            .await
+            .expect("collect messages body");
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let tool_use = value
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| {
+                content
+                    .iter()
+                    .find(|part| part.get("type").and_then(Value::as_str) == Some("tool_use"))
+            })
+            .expect("tool_use content block");
+
+        assert_eq!(tool_use["id"], "call_native");
+        assert_eq!(tool_use["name"], "dispatch");
+        assert_eq!(tool_use["input"]["text"], "hi");
+        assert_eq!(value["stop_reason"], "tool_use");
     }
 
     #[tokio::test]

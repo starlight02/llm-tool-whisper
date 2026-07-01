@@ -1,5 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 
 use crate::{
@@ -232,6 +233,43 @@ impl AppConfig {
                     provider.name
                 )));
             }
+            if HeaderName::from_bytes(provider.auth_header.as_bytes()).is_err() {
+                return Err(AppError::Config(format!(
+                    "provider `{}` has invalid `auth_header` `{}`",
+                    provider.name, provider.auth_header
+                )));
+            }
+            if let Some(api_key) = provider
+                .api_key
+                .as_ref()
+                .filter(|key| !key.trim().is_empty())
+            {
+                let header_value = if provider.auth_scheme.trim().is_empty() {
+                    api_key.to_string()
+                } else {
+                    format!("{} {}", provider.auth_scheme.trim(), api_key)
+                };
+                if HeaderValue::from_str(&header_value).is_err() {
+                    return Err(AppError::Config(format!(
+                        "provider `{}` builds an invalid `{}` header value",
+                        provider.name, provider.auth_header
+                    )));
+                }
+            }
+            for (name, value) in &provider.headers {
+                if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    return Err(AppError::Config(format!(
+                        "provider `{}` has invalid header name `{}`",
+                        provider.name, name
+                    )));
+                }
+                if HeaderValue::from_str(value).is_err() {
+                    return Err(AppError::Config(format!(
+                        "provider `{}` has invalid value for header `{}`",
+                        provider.name, name
+                    )));
+                }
+            }
             if provider.models.is_empty() {
                 return Err(AppError::Config(format!(
                     "provider `{}` must define at least one model",
@@ -255,5 +293,73 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_with_provider(provider: ProviderConfig) -> RawConfig {
+        RawConfig {
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            upstream: UpstreamConfig::default(),
+            providers: vec![provider],
+        }
+    }
+
+    fn provider() -> ProviderConfig {
+        ProviderConfig {
+            name: "mock".to_string(),
+            protocol: ApiProtocol::Chat,
+            upstream_protocol: None,
+            base_url: "https://example.com/v1".to_string(),
+            api_key: Some("token".to_string()),
+            auth_header: "Authorization".to_string(),
+            auth_scheme: "Bearer".to_string(),
+            headers: HashMap::new(),
+            models: vec!["model".to_string()],
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_provider_auth_header_name() {
+        let mut provider = provider();
+        provider.auth_header = "bad header".to_string();
+
+        let error = AppConfig::validate(&raw_with_provider(provider)).unwrap_err();
+
+        assert!(error.to_string().contains("invalid `auth_header`"));
+    }
+
+    #[test]
+    fn rejects_invalid_provider_auth_header_value() {
+        let mut provider = provider();
+        provider.api_key = Some("bad\nkey".to_string());
+
+        let error = AppConfig::validate(&raw_with_provider(provider)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid `Authorization` header value")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_static_provider_header() {
+        let mut provider = provider();
+        provider
+            .headers
+            .insert("x-good".to_string(), "bad\nvalue".to_string());
+
+        let error = AppConfig::validate(&raw_with_provider(provider)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid value for header `x-good`")
+        );
     }
 }

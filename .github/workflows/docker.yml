@@ -37,16 +37,81 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
+      version_tag: ${{ steps.version-tag.outputs.version_tag }}
+      version_minor_tag: ${{ steps.version-tag.outputs.version_minor_tag }}
+      version_major_tag: ${{ steps.version-tag.outputs.version_major_tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Fetch tags
         run: git fetch --tags --force || true
+
+      - name: Create git tag from Cargo.toml version
+        id: version-tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          data = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          print(data["package"]["version"])
+          PY
+          )"
+          tag="v${version}"
+          before="${{ github.event.before }}"
+          old_version=""
+
+          if [[ -n "$before" && ! "$before" =~ ^0+$ ]] && git cat-file -e "$before:Cargo.toml" 2>/dev/null; then
+            old_version="$(git show "$before:Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')"
+          fi
+
+          version_changed=false
+          if [[ "$old_version" != "$version" ]]; then
+            version_changed=true
+          fi
+
+          tag_sha=""
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            tag_sha="$(git rev-list -n 1 "$tag")"
+          fi
+
+          if [[ -n "$tag_sha" && "$tag_sha" == "${{ github.sha }}" ]]; then
+            echo "Version tag ${tag} already points at this commit."
+            echo "version_tag=${tag}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$tag_sha" ]]; then
+            if [[ "$version_changed" == "true" ]]; then
+              echo "::error::Cargo.toml version ${version} changed, but tag ${tag} already points at ${tag_sha}. Bump the version or move/delete the existing tag intentionally."
+              exit 1
+            fi
+            echo "Version ${version} is already tagged at ${tag_sha}; not creating a new tag for this non-version push."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$tag" "${{ github.sha }}"
+            git push origin "refs/tags/${tag}"
+            echo "Created version tag ${tag}."
+            echo "version_tag=${tag}" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -n "${tag_sha}" && "${tag_sha}" != "${{ github.sha }}" && "$version_changed" != "true" ]]; then
+            exit 0
+          fi
+
+          if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "version_minor_tag=v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+            echo "version_major_tag=v${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Decide whether Docker build is needed
         id: filter
@@ -63,17 +128,12 @@ jobs:
           fi
 
           # Non-PR push: branch or tag.
-          # On regular branch pushes we want to update :latest + :sha.
-          # On release (pushing a tag), we also want the semver tags.
-          # To avoid duplicate expensive builds when a commit is pushed to master
-          # *and* tagged at the same time, skip docker build on the branch push
-          # if the commit already has a tag (let the tag-triggered run handle it).
+          # On regular branch pushes we update :latest + :sha, and if this run
+          # created the Cargo.toml version tag, the merge job also applies the
+          # release tags. A tag created with GITHUB_TOKEN does not trigger a
+          # second workflow run, so the branch run must publish those tags itself.
           if [[ "${{ github.ref }}" == refs/heads/* ]]; then
-            if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
-              echo "docker=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "docker=true" >> "$GITHUB_OUTPUT"
-            fi
+            echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             # tag push (refs/tags/v*)
             echo "docker=true" >> "$GITHUB_OUTPUT"
@@ -183,7 +243,7 @@ jobs:
   # Stitch the per-arch digests into one multi-arch manifest and tag it. Runs
   # only when the build legs actually pushed (i.e. not on pull_request).
   merge:
-    needs: build
+    needs: [changes, build]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -219,6 +279,10 @@ jobs:
             type=sha,format=short
             # main branch -> latest
             type=raw,value=latest,enable={{is_default_branch}}
+            # branch push with an auto-created Cargo.toml version tag
+            type=raw,value=${{ needs.changes.outputs.version_tag }},enable=${{ needs.changes.outputs.version_tag != '' }}
+            type=raw,value=${{ needs.changes.outputs.version_minor_tag }},enable=${{ needs.changes.outputs.version_minor_tag != '' }}
+            type=raw,value=${{ needs.changes.outputs.version_major_tag }},enable=${{ needs.changes.outputs.version_major_tag != '' }}
             # v1.2.3 git tag -> v1.2.3, v1.2, v1
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
